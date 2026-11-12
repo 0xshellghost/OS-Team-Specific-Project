@@ -1,0 +1,12 @@
+*~
+_*
+*.o
+*.d
+*.asm
+*.sym
+*.img
+xv6-project5/mkfs/mkfs
+xv6-project5/kernel/kernel
+xv6-project5/user/usys.S
+.gdbinit
+TAGS

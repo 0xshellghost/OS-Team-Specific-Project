@@ -1,0 +1,4259 @@
+diff --git a/Makefile b/Makefile
+index a26f3db..e450616 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,11 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o \
++  $K/waitq.o \
++  $K/sem.o \
++  $K/futex.o \
++  $K/shm.o
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -61,7 +65,7 @@ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+ # Deterministic builds.
+-DETFLAGS = -ffile-prefix-map=$(CURDIR)=.
++DETFLAGS = "-ffile-prefix-map=$(CURDIR)=."
+ 
+ CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer -ggdb -gdwarf-2
+ CFLAGS += $(DETFLAGS)
+@@ -102,7 +106,7 @@ $K/%.o: $K/%.S
+ tags: $(OBJS)
+ 	etags kernel/*.S kernel/*.c
+ 
+-ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
++ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o $U/usync.o
+ 
+ _%: %.o $(ULIB) $U/user.ld
+ 	$(LD) $(LDFLAGS) -T $U/user.ld -o $@ $< $(ULIB)
+@@ -151,6 +155,16 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_semtest\
++	$U/_condtest\
++	$U/_futextest\
++	$U/_shmtest\
++	$U/_pcbuf\
++	$U/_rwlock\
++	$U/_philo\
++	$U/_p5test\
++	$U/_locktest\
++	$U/_hotlocks\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/PROJECT5.md b/PROJECT5.md
+new file mode 100644
+index 0000000..ddb286d
+--- /dev/null
++++ b/PROJECT5.md
+@@ -0,0 +1,150 @@
++# Project 5 – Semaphores, Condition Variables, Futexes, and Lock Profiling
++
++Target: xv6-riscv, MIT master as of 2026-11 (commit `fa2ddcb`, the one with
++`sleep_prepare()`/`sleep()`). Nothing in the new code calls `sleep()`, so
++the kernel half should drop onto older xv6-riscv trees with only small edits
++(see "What is not done").
++
++## What was added
++
++### Kernel
++
++| file | what it does |
++|---|---|
++| `kernel/waitq.[ch]` | FIFO wait queue. Nodes live on the kernel stack. `wq_block()` is a hand-written sleep that also checks `p->killed` under `p->lock`, so a `kill()` cannot slip in between releasing the queue lock and going to sleep. |
++| `kernel/sem.c` | Counting semaphores and condition variables, plus their system calls. |
++| `kernel/futex.c` | `futex_wait` / `futex_wake`, hashed buckets keyed on the *physical* address of the word. |
++| `kernel/shm.c`, `vm.c` | `shm_map()`: pages that `fork()` shares instead of copying (software PTE bit `PTE_SHM`). |
++| `kernel/kalloc.c` | Per-page reference counts, so a shared page is freed exactly once, by its last user. |
++| `proc.c`, `exec.c`, `sysproc.c` | fork/exit/exec bookkeeping for the shared window, handles, and syscall dispatch. |
++| `kernel/spinlock.[ch]` | Lock-contention profiler: tracks spin iterations, total acquires, and contention events per spinlock; registry and `lockstat` kernel copyout. |
++
++### System calls
++
++```c
++int   sem_init(int value);          // -> handle, or -1
++int   sem_wait(int sd);             // 0, or -1
++int   sem_trywait(int sd);          // 0 got it, 1 would block, -1 error
++int   sem_post(int sd);
++int   sem_getvalue(int sd);
++int   sem_destroy(int sd);          // drops this process's handle
++
++int   cond_init(void);
++int   cond_wait(int cd, int sd);    // sd = semaphore used as the mutex
++int   cond_signal(int cd);
++int   cond_broadcast(int cd);
++int   cond_destroy(int cd);
++
++int   futex_wait(int *addr, int val);   // 0 woken, 1 *addr != val, -1 error/killed
++int   futex_wake(int *addr, int n);     // number woken (n < 0: all)
++
++void *shm_map(int npages);          // zeroed pages shared with future children
++
++int   lockstat(struct lock_stat *stats, int max, int mode); // 0=aggregate, 1=reset, 2=raw
++```
++
++### User space
++
++* `user/usync.[ch]` – futex mutex (3-state, Drepper) and futex condition variable.
++* `user/semtest.c`, `condtest.c`, `futextest.c`, `shmtest.c`, `locktest.c` – unit tests.
++* `user/pcbuf.c` – bounded buffer: semaphores / kernel condvars / futex.
++* `user/rwlock.c` – readers-writers, reader preference and writer preference,
++  with a workload and a timed scenario that shows the difference.
++* `user/philo.c` – dining philosophers: naive (deadlocks on purpose),
++  resource ordering, N-1 seats, Tanenbaum state array, monitor with condvars.
++* `user/hotlocks.c` – lock-contention profiler CLI and hot lock analyzer tool.
++* `user/p5test.c` – runs everything (now all 9 test suites). `test-p5.py` boots qemu and drives it.
++
++## Design decisions worth knowing
++
++**Why `shm_map()` exists.** xv6 has no threads and processes share nothing, so
++a semaphore has nothing to protect. `shm_map()` is the smallest fix. If your
++xv6 already has `clone()`-style threads you can ignore it: the primitives are
++keyed on physical addresses and work for threads unchanged.
++
++**Handles behave like file descriptors.** Per-process bitmask, inherited by
++`fork()`, reference counted, released at `exit()`. A crashed process cannot leak
++table slots, and stale or invented handles are rejected.
++
++**Semaphores are strict FIFO with direct hand-off.** `sem_post()` with sleepers
++gives the token to the oldest waiter instead of incrementing the counter, so
++nobody can barge in and nobody starves. Invariant: `value > 0` implies empty queue.
++
++**Condition variables are Mesa style.** `cond_wait` enqueues itself *before* it
++releases the mutex (under the condvar's lock), so a signal cannot fall in the
++gap. Lock order is cond lock, then semaphore lock, then `p->lock`. `cond_wait`
++refuses a mutex whose value is not 0 (plainly unlocked).
++
++**Futex.** The compare and the sleep happen under the bucket lock; wake takes the
++same lock. The load of the user word is atomic. Wait returns 1 instead of
++sleeping on a mismatch. Wake never faults a lazily-allocated page in.
++
++**Kill safety.** A killed sleeper removes its own node from the queue. If a wake
++and a kill race, the wake wins and the token is not lost.
++
++**Lock-Contention Profiler.**
++* In `acquire()`: an iteration counter `spins` measures iterations spent spinning
++  in `while (__atomic_exchange_n(&lk->locked, 1, __ATOMIC_ACQUIRE) != 0)`.
++* When the lock is successfully claimed, the CPU updates `lk->n_acq++`,
++  `lk->n_contended++`, and `lk->n_spins += spins` safely without additional locks
++  because the spinlock is now exclusively owned by the calling CPU.
++* Every lock registers in `lock_profiler_register()` during `initlock()`.
++* `lockstat` syscall supports:
++  - `LOCKSTAT_AGGREGATE (0)`: rolls up contention metrics across all locks sharing
++    the same name (e.g. all 64 process locks under `"proc"`, all 16 futex buckets).
++  - `LOCKSTAT_RESET (1)`: atomically clears spin and acquisition counters.
++  - `LOCKSTAT_RAW (2)`: extracts unaggregated per-instance lock structures.
++
++## Hot Locks in xv6 (Empirical Findings)
++
++Running `hotlocks` on multi-core QEMU (`CPUS=3`) identifies the primary lock bottlenecks in xv6:
++
++1. **`kmem` (Physical Page Allocator)**:
++   * **Why it contends**: xv6 uses a single global free list protected by `kmem.lock`.
++     When multiple CPUs concurrently allocate and deallocate pages (e.g. during `fork`,
++     `exec`, `sbrk`, or IPC buffer creation), all CPUs bottleneck on `kmem.lock`.
++   * **Mitigation (e.g. MIT lock lab)**: Per-CPU freelists with lock stealing.
++
++2. **`bcache` (Disk Buffer Cache)**:
++   * **Why it contends**: A single global spinlock `bcache.lock` guards both the buffer
++     hash chains and the global LRU doubly-linked list. Multiple processes performing
++     concurrent file and inode reads/writes contend severely on `bcache.lock`.
++   * **Mitigation**: Hash-bucket locks instead of a single global lock.
++
++3. **`proc` and `wait_lock` (Process Table)**:
++   * **Why it contends**: When many processes fork, exit, and wait concurrently, parent
++     processes scanning children hold `wait_lock`, while schedulers and state transitions
++     contend on individual `p->lock` instances.
++
++4. **Synchronization Locks (`sem`, `semtab`, `futex`)**:
++   * Contend under multi-threaded producer-consumer and barrier benchmarks. The 16
++     separate futex hash buckets successfully distribute contention compared to a
++     monolithic lock.
++
++## Building and testing
++
++```
++make qemu                 # then, at the shell prompt:
++$ p5test                  # everything (all 9 suites)
++$ locktest                # lockstat unit tests
++$ hotlocks                # run multi-core benchmark and view hot locks table
++$ hotlocks pcbuf          # profile lock contention during bounded buffer
++$ hotlocks p5test         # profile lock contention across the entire suite
++$ semtest                 # or any single program
++$ pcbuf cond 4 2 100      # producers, consumers, items per producer
++$ rwlock writer
++$ philo monitor -v        # -v prints who eats when
++```
++
++Without typing: `./test-p5.py p5test` (needs python3; `CPUS=1` for one hart).
++To run hotlocks test automatically: `./test-p5.py locktest hotlocks`.
++
++## Limits / things to be aware of
++
++* Semaphores and condvars are only shareable through `fork()` inheritance.
++  There are no named objects.
++* A process that dies holding a "mutex" semaphore leaves it locked. There is no
++  owner tracking.
++* `exec()` keeps semaphore/condvar handles (like fds) but drops shared memory.
++* Per-process cap of 64 shared pages; 64 semaphores and 64 condvars system-wide.
++* `FSSIZE` is 4000 blocks so all test and profiler programs fit.
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 0ae6896..2525467 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -6,6 +6,7 @@ struct inode;
+ struct pipe;
+ struct proc;
+ struct spinlock;
++struct lock_stat;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
+@@ -60,6 +61,7 @@ void            ireclaim(int);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            krefinc(void *);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -85,7 +87,7 @@ int             kfork(void);
+ int             growproc(int);
+ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+-void            proc_freepagetable(pagetable_t, uint64);
++void            proc_freepagetable(pagetable_t, uint64, uint64);
+ int             kkill(int);
+ int             killed(struct proc*);
+ void            setkilled(struct proc*);
+@@ -114,6 +116,8 @@ void            initlock(struct spinlock*, char*);
+ void            release(struct spinlock*);
+ void            push_off(void);
+ void            pop_off(void);
++void            lock_profiler_register(struct spinlock*);
++int             lock_stat_copy(struct lock_stat*, int, int);
+ 
+ // sleeplock.c
+ void            acquiresleep(struct sleeplock*);
+@@ -170,6 +174,16 @@ int             copyin(pagetable_t, uint64, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, uint64, char *, uint64, uint64);
+ int             ismapped(pagetable_t, uint64);
+ uint64          vmfault(pagetable_t, uint64, uint64, int);
++int             shmmap(pagetable_t, uint64, int);
++int             shmcopy(pagetable_t, pagetable_t, uint64);
++uint64          uva2pa(pagetable_t, uint64, uint64);
++
++// sem.c (semaphores and condition variables)
++void            syncinit(void);
++void            semfork(struct proc*, struct proc*);
++void            semexit(struct proc*);
++void            condfork(struct proc*, struct proc*);
++void            condexit(struct proc*);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 8c9673f..3175fd8 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -82,6 +82,7 @@ kexec(char *path, char **argv)
+ 
+   p = myproc();
+   uint64 oldsz = p->sz;
++  uint64 oldshm = p->shmsz;
+ 
+   // Allocate some pages at the next page boundary.
+   // Make the first inaccessible as a stack guard.
+@@ -133,15 +134,16 @@ kexec(char *path, char **argv)
+   oldpagetable = p->pagetable;
+   p->pagetable = pagetable;
+   p->sz = sz;
++  p->shmsz = 0; // a new image starts without shared pages
+   p->trapframe->epc = elf.entry; // initial program counter = ulib.c:start()
+   p->trapframe->sp = sp;         // initial stack pointer
+-  proc_freepagetable(oldpagetable, oldsz);
++  proc_freepagetable(oldpagetable, oldsz, oldshm);
+ 
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+ bad:
+   if (pagetable)
+-    proc_freepagetable(pagetable, sz);
++    proc_freepagetable(pagetable, sz, 0);
+   if (ip) {
+     iunlockput(ip);
+     end_op();
+diff --git a/kernel/futex.c b/kernel/futex.c
+new file mode 100644
+index 0000000..b86d519
+--- /dev/null
++++ b/kernel/futex.c
+@@ -0,0 +1,109 @@
++// futex_wait(addr, val) / futex_wake(addr, n)
++//
++// The kernel half of a futex: a place to sleep while a user-space word has
++// a particular value, and a way to wake sleepers. All policy (what the word
++// means, who owns the lock) stays in user space; see user/usync.c.
++//
++// Wait queues are keyed on the *physical* address of the word, not the
++// virtual one. For pages mapped by shm_map() that is what makes the futex
++// work between processes: parent and child see the word at the same virtual
++// address, and so would any two unrelated private pages, but only shared
++// pages have the same physical address.
++//
++// Queues live in a small hash table, NFUTEXQ buckets, one lock each, so
++// unrelated futexes rarely contend. Each waiter sits in its bucket's list
++// with its key; wake walks the (short) list and picks the matching ones in
++// FIFO order.
++
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "waitq.h"
++
++static struct {
++  struct spinlock lock;
++  struct waitq q;
++} bucket[NFUTEXQ];
++
++void
++futexinit(void)
++{
++  int i;
++
++  for (i = 0; i < NFUTEXQ; i++) {
++    initlock(&bucket[i].lock, "futex");
++    wq_init(&bucket[i].q);
++  }
++}
++
++#define BUCKET(key) (&bucket[((key) >> 2) % NFUTEXQ])
++
++// int futex_wait(int *addr, int val)
++//
++// If *addr == val, sleep until futex_wake() on the same word picks us.
++// The comparison and going to sleep happen under the bucket lock, and
++// futex_wake() takes the same lock, so a wake can't fall between the two.
++//
++//   0   woken up
++//   1   *addr != val, didn't sleep (the caller should look at the word again)
++//  -1   bad address (null, unaligned, unmapped), or killed while waiting
++uint64
++sys_futex_wait(void)
++{
++  struct proc *p = myproc();
++  uint64 uaddr, key;
++  int val, r;
++  struct waiter w;
++
++  argaddr(0, &uaddr);
++  argint(1, &val);
++  if (uaddr % sizeof(int) != 0)
++    return -1;
++  if ((key = uva2pa(p->pagetable, p->sz, uaddr)) == 0)
++    return -1;
++
++  acquire(&BUCKET(key)->lock);
++  // The kernel maps all RAM 1:1, so key is also a kernel pointer. A user
++  // process on another CPU may be storing to this word right now, hence
++  // the atomic load.
++  if (__atomic_load_n((int *)key, __ATOMIC_ACQUIRE) != val) {
++    release(&BUCKET(key)->lock);
++    return 1;
++  }
++  wq_enqueue(&BUCKET(key)->q, &w, key);
++  r = wq_block(&w, &BUCKET(key)->lock);
++  release(&BUCKET(key)->lock);
++  return r;
++}
++
++// int futex_wake(int *addr, int n)
++// Wake at most n processes waiting on addr, oldest first (n < 0: all).
++// Returns the number woken, or -1 for a bad address.
++uint64
++sys_futex_wake(void)
++{
++  struct proc *p = myproc();
++  uint64 uaddr, key;
++  int n, woken;
++
++  argaddr(0, &uaddr);
++  argint(1, &n);
++  if (uaddr % sizeof(int) != 0)
++    return -1;
++
++  // Don't fault pages in just to wake nobody: a word whose page isn't
++  // mapped yet (lazy heap) can't have any sleepers.
++  key = walkaddr(p->pagetable, uaddr);
++  if (key == 0)
++    return uaddr < p->sz ? 0 : -1;
++  key += uaddr & (PGSIZE - 1);
++
++  acquire(&BUCKET(key)->lock);
++  woken = wq_wake_key(&BUCKET(key)->q, key, n);
++  release(&BUCKET(key)->lock);
++  return woken;
++}
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 2fcec38..7221d0f 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -23,6 +23,14 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
++// One reference count per physical page. A page that came out of kalloc()
++// starts at 1; krefinc() adds a holder and kfree() only gives the page back
++// once the last holder is gone. shm_map() pages rely on this: they sit in
++// several page tables at once, and whoever exits last has to free them.
++// Protected by kmem.lock.
++#define PAIDX(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
++static uchar refcnt[(PHYSTOP - KERNBASE) / PGSIZE];
++
+ void
+ kinit()
+ {
+@@ -35,22 +43,33 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char *)PGROUNDUP((uint64)pa_start);
+-  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
++  for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE) {
++    refcnt[PAIDX(p)] = 1; // so that the kfree() below drops it to 0
+     kfree(p);
++  }
+ }
+ 
+-// Free the page of physical memory pointed at by pa,
+-// which normally should have been returned by a
+-// call to kalloc().  (The exception is when
+-// initializing the allocator; see kinit above.)
++// Drop one reference to the page of physical memory pointed at by pa,
++// which normally should have been returned by a call to kalloc().
++// (The exception is when initializing the allocator; see kinit above.)
++// The page goes back on the free list when the last reference is gone.
+ void
+ kfree(void *pa)
+ {
+   struct run *r;
++  int last;
+ 
+   if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  acquire(&kmem.lock);
++  if (refcnt[PAIDX(pa)] == 0)
++    panic("kfree: refcnt");
++  last = (--refcnt[PAIDX(pa)] == 0);
++  release(&kmem.lock);
++  if (!last)
++    return;
++
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -72,11 +91,27 @@ kalloc(void)
+ 
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if (r)
++  if (r) {
+     kmem.freelist = r->next;
++    refcnt[PAIDX(r)] = 1;
++  }
+   release(&kmem.lock);
+ 
+   if (r)
+     memset((char *)r, 5, PGSIZE); // fill with junk
+   return (void *)r;
+ }
++
++// Add a reference to a page that is already allocated.
++void
++krefinc(void *pa)
++{
++  if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
++    panic("krefinc");
++
++  acquire(&kmem.lock);
++  if (refcnt[PAIDX(pa)] == 0 || refcnt[PAIDX(pa)] == 255)
++    panic("krefinc: bad count");
++  refcnt[PAIDX(pa)]++;
++  release(&kmem.lock);
++}
+diff --git a/kernel/main.c b/kernel/main.c
+index df58e32..743ae1b 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -27,6 +27,7 @@ main()
+     binit();            // buffer cache
+     iinit();            // inode table
+     fileinit();         // file table
++    syncinit();         // semaphores, condvars, futexes
+     virtio_disk_init(); // emulated hard disk
+     userinit();         // first user process
+ 
+diff --git a/kernel/memlayout.h b/kernel/memlayout.h
+index 4f026ed..a9b02d5 100644
+--- a/kernel/memlayout.h
++++ b/kernel/memlayout.h
+@@ -61,3 +61,8 @@
+ //   TRAPFRAME (p->trapframe, used by the trampoline)
+ //   TRAMPOLINE (the same page as in the kernel)
+ #define TRAPFRAME (TRAMPOLINE - PGSIZE)
++
++// shm_map() hands out pages from a window that ends at SHMTOP and grows
++// downwards, starting just under the trapframe. p->shmsz is its current size.
++// The heap (sbrk) must never run into it, see growproc().
++#define SHMTOP TRAPFRAME
+diff --git a/kernel/param.h b/kernel/param.h
+index 1d69801..7cb409f 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -9,6 +9,10 @@
+ #define MAXOPBLOCKS 10                // max # of blocks any FS op writes
+ #define LOGBLOCKS   (MAXOPBLOCKS * 3) // max data blocks in on-disk log
+ #define NBUF        (MAXOPBLOCKS * 3) // size of disk block cache
+-#define FSSIZE      2000              // size of file system in blocks
++#define FSSIZE      4000              // size of file system in blocks
+ #define MAXPATH     128               // maximum file path name
+ #define USERSTACK   1                 // user stack pages
++#define NSEM        64                // kernel semaphores, system wide (<= 64)
++#define NCOND       64                // kernel condition variables (<= 64)
++#define NFUTEXQ     16                // futex hash buckets
++#define SHM_MAXPAGES 64               // shared pages one process may map
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 31f23a3..8da48cb 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -159,9 +159,12 @@ freeproc(struct proc *p)
+     kfree((void *)p->trapframe);
+   p->trapframe = 0;
+   if (p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
++    proc_freepagetable(p->pagetable, p->sz, p->shmsz);
+   p->pagetable = 0;
+   p->sz = 0;
++  p->shmsz = 0;
++  p->semmask = 0;
++  p->condmask = 0;
+   p->pid = 0;
+   p->name[0] = 0;
+   p->chan = 0;
+@@ -207,10 +210,13 @@ proc_pagetable(struct proc *p)
+ // Free a process's page table, and free the
+ // physical memory it refers to.
+ void
+-proc_freepagetable(pagetable_t pagetable, uint64 sz)
++proc_freepagetable(pagetable_t pagetable, uint64 sz, uint64 shmsz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  // shared pages: kfree() only releases the memory with the last mapping
++  if (shmsz > 0)
++    uvmunmap(pagetable, SHMTOP - shmsz, shmsz / PGSIZE, 1);
+   uvmfree(pagetable, sz);
+ }
+ 
+@@ -240,7 +246,7 @@ growproc(int n)
+ 
+   sz = p->sz;
+   if (n > 0) {
+-    if (sz + n > TRAPFRAME) {
++    if (sz + n > SHMTOP - p->shmsz) { // don't grow into the shared window
+       return -1;
+     }
+     if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+@@ -275,6 +281,19 @@ kfork(void)
+   }
+   np->sz = p->sz;
+ 
++  // Shared pages are mapped into the child, not copied.
++  if (shmcopy(p->pagetable, np->pagetable, p->shmsz) < 0) {
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++  np->shmsz = p->shmsz;
++
++  // The child inherits semaphore and condvar handles, and with them a
++  // reference to each object (like dup() does for open files).
++  semfork(p, np);
++  condfork(p, np);
++
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
+@@ -344,6 +363,10 @@ kexit(int status)
+   end_op();
+   p->cwd = 0;
+ 
++  // Let go of our semaphores and condition variables.
++  semexit(p);
++  condexit(p);
++
+   acquire(&wait_lock);
+ 
+   // Give any children to init.
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..1e8c7af 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -101,4 +101,9 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // project 5: blocking synchronization
++  uint64 shmsz;                // bytes of shared memory below SHMTOP
++  uint64 semmask;              // bit i set: this process holds semaphore i
++  uint64 condmask;             // same for condition variables
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 3e982ab..4aa34d5 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -397,6 +397,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
++#define PTE_SHM (1L << 8) // software (RSW) bit: shared page, fork maps it, never copies it
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/sem.c b/kernel/sem.c
+new file mode 100644
+index 0000000..b5bfe6e
+--- /dev/null
++++ b/kernel/sem.c
+@@ -0,0 +1,458 @@
++// Kernel-managed counting semaphores and condition variables.
++//
++// Handles
++// -------
++// A semaphore or condvar is named by a small integer, like a file
++// descriptor. Every process has a bitmask (p->semmask, p->condmask) of the
++// handles it owns, and an object carries a count of how many processes
++// hold it:
++//
++//   sem_init()      allocates an object and gives the caller a handle
++//   fork()          the child gets the same handles, refs++ for each
++//   sem_destroy()   drops the caller's handle, refs--
++//   exit()          drops whatever handles are left
++//
++// An object is free again when its last holder lets go, so a crashing
++// process can't leak table slots. Handles are checked against the mask,
++// which also catches use after destroy and made-up numbers.
++//
++// Locking
++// -------
++//   semtab.lock / condtab.lock   slot allocation and the refs counts
++//   ksem.lock / kcond.lock       value and wait queue of one object
++//
++// Lock order is cond->lock, then sem->lock (cond_wait releases the user's
++// mutex while it holds the condvar's lock). Nothing ever goes the other
++// way. p->lock comes last, as everywhere in xv6.
++//
++// Semaphores are strict FIFO. sem_post() with sleepers does not bump the
++// counter, it hands the token straight to the longest waiter. Nobody can
++// sneak in between the post and the wakeup, and a sleeper can't be starved
++// by a process that keeps calling sem_wait() in a loop.
++
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "waitq.h"
++
++#define SEM_MAX 0x7fffffff
++
++struct ksem {
++  struct spinlock lock;
++  int refs;          // holders, protected by semtab.lock
++  int value;         // tokens available. Never > 0 while q is non-empty.
++  struct waitq q;
++};
++
++struct kcond {
++  struct spinlock lock;
++  int refs;          // holders, protected by condtab.lock
++  struct waitq q;
++};
++
++static struct {
++  struct spinlock lock;
++  struct ksem s[NSEM];
++} semtab;
++
++static struct {
++  struct spinlock lock;
++  struct kcond c[NCOND];
++} condtab;
++
++void futexinit(void); // futex.c
++
++void
++syncinit(void)
++{
++  int i;
++
++  initlock(&semtab.lock, "semtab");
++  for (i = 0; i < NSEM; i++) {
++    initlock(&semtab.s[i].lock, "sem");
++    wq_init(&semtab.s[i].q);
++  }
++  initlock(&condtab.lock, "condtab");
++  for (i = 0; i < NCOND; i++) {
++    initlock(&condtab.c[i].lock, "cond");
++    wq_init(&condtab.c[i].q);
++  }
++  futexinit();
++}
++
++// ---------------------------------------------------------------------
++// handle bookkeeping
++// ---------------------------------------------------------------------
++
++static struct ksem *
++semlookup(int sd)
++{
++  struct proc *p = myproc();
++
++  if (sd < 0 || sd >= NSEM || (p->semmask & (1UL << sd)) == 0)
++    return 0;
++  return &semtab.s[sd];
++}
++
++static struct kcond *
++condlookup(int cd)
++{
++  struct proc *p = myproc();
++
++  if (cd < 0 || cd >= NCOND || (p->condmask & (1UL << cd)) == 0)
++    return 0;
++  return &condtab.c[cd];
++}
++
++// fork(): np starts with all of p's handles.
++void
++semfork(struct proc *p, struct proc *np)
++{
++  int i;
++
++  np->semmask = p->semmask;
++  if (p->semmask == 0)
++    return;
++  acquire(&semtab.lock);
++  for (i = 0; i < NSEM; i++)
++    if (p->semmask & (1UL << i))
++      semtab.s[i].refs++;
++  release(&semtab.lock);
++}
++
++void
++condfork(struct proc *p, struct proc *np)
++{
++  int i;
++
++  np->condmask = p->condmask;
++  if (p->condmask == 0)
++    return;
++  acquire(&condtab.lock);
++  for (i = 0; i < NCOND; i++)
++    if (p->condmask & (1UL << i))
++      condtab.c[i].refs++;
++  release(&condtab.lock);
++}
++
++// exit(): drop every handle p still has. A process that exits can't be
++// asleep on any of them, so a count that reaches zero means an empty queue.
++void
++semexit(struct proc *p)
++{
++  int i;
++
++  if (p->semmask == 0)
++    return;
++  acquire(&semtab.lock);
++  for (i = 0; i < NSEM; i++)
++    if (p->semmask & (1UL << i))
++      semtab.s[i].refs--;
++  release(&semtab.lock);
++  p->semmask = 0;
++}
++
++void
++condexit(struct proc *p)
++{
++  int i;
++
++  if (p->condmask == 0)
++    return;
++  acquire(&condtab.lock);
++  for (i = 0; i < NCOND; i++)
++    if (p->condmask & (1UL << i))
++      condtab.c[i].refs--;
++  release(&condtab.lock);
++  p->condmask = 0;
++}
++
++// ---------------------------------------------------------------------
++// semaphore core. Both are also used by cond_wait().
++// ---------------------------------------------------------------------
++
++// P(). Returns 0 with a token in hand, or -1 if killed while waiting.
++static int
++semdown(struct ksem *s)
++{
++  struct waiter w;
++  int r;
++
++  acquire(&s->lock);
++  if (s->value > 0) {
++    s->value--;
++    release(&s->lock);
++    return 0;
++  }
++  // No token. Queue up; sem_post() will hand one directly to us.
++  wq_enqueue(&s->q, &w, 0);
++  r = wq_block(&w, &s->lock);
++  release(&s->lock);
++  return r;
++}
++
++// V(). Returns 0, or -1 if the counter would overflow.
++static int
++semup(struct ksem *s)
++{
++  acquire(&s->lock);
++  if (wq_wake(&s->q, 1) == 0) {
++    if (s->value == SEM_MAX) {
++      release(&s->lock);
++      return -1;
++    }
++    s->value++;
++  }
++  release(&s->lock);
++  return 0;
++}
++
++// ---------------------------------------------------------------------
++// semaphore system calls
++// ---------------------------------------------------------------------
++
++// int sem_init(int value) -> handle, or -1
++uint64
++sys_sem_init(void)
++{
++  struct proc *p = myproc();
++  struct ksem *s;
++  int value, i;
++
++  argint(0, &value);
++  if (value < 0)
++    return -1;
++
++  acquire(&semtab.lock);
++  for (i = 0; i < NSEM; i++)
++    if (semtab.s[i].refs == 0)
++      break;
++  if (i == NSEM) {
++    release(&semtab.lock);
++    return -1;
++  }
++  s = &semtab.s[i];
++  s->refs = 1;
++  s->value = value; // nobody else can see slot i until we publish the handle
++  release(&semtab.lock);
++
++  p->semmask |= 1UL << i;
++  return i;
++}
++
++// int sem_wait(int sd) -> 0, or -1 (bad handle, or killed while waiting)
++uint64
++sys_sem_wait(void)
++{
++  struct ksem *s;
++  int sd;
++
++  argint(0, &sd);
++  if ((s = semlookup(sd)) == 0)
++    return -1;
++  return semdown(s);
++}
++
++// int sem_trywait(int sd) -> 0 got a token, 1 would block, -1 bad handle
++uint64
++sys_sem_trywait(void)
++{
++  struct ksem *s;
++  int sd, r;
++
++  argint(0, &sd);
++  if ((s = semlookup(sd)) == 0)
++    return -1;
++
++  acquire(&s->lock);
++  if (s->value > 0) {
++    s->value--;
++    r = 0;
++  } else {
++    r = 1;
++  }
++  release(&s->lock);
++  return r;
++}
++
++// int sem_post(int sd) -> 0, or -1 (bad handle, counter overflow)
++uint64
++sys_sem_post(void)
++{
++  struct ksem *s;
++  int sd;
++
++  argint(0, &sd);
++  if ((s = semlookup(sd)) == 0)
++    return -1;
++  return semup(s);
++}
++
++// int sem_getvalue(int sd) -> current counter, or -1.
++// Only a snapshot: it may be stale before the caller looks at it.
++uint64
++sys_sem_getvalue(void)
++{
++  struct ksem *s;
++  int sd, v;
++
++  argint(0, &sd);
++  if ((s = semlookup(sd)) == 0)
++    return -1;
++  acquire(&s->lock);
++  v = s->value;
++  release(&s->lock);
++  return v;
++}
++
++// int sem_destroy(int sd) -> 0, or -1
++// Gives up this process's handle. The semaphore itself lives on for any
++// other process that still holds it (a child, say).
++uint64
++sys_sem_destroy(void)
++{
++  struct proc *p = myproc();
++  int sd;
++
++  argint(0, &sd);
++  if (semlookup(sd) == 0)
++    return -1;
++
++  p->semmask &= ~(1UL << sd);
++  acquire(&semtab.lock);
++  semtab.s[sd].refs--;
++  release(&semtab.lock);
++  return 0;
++}
++
++// ---------------------------------------------------------------------
++// condition variables
++//
++// Mesa semantics: a signaled process has to get the mutex back before
++// cond_wait() returns, and by then somebody else may have changed the
++// state again, so callers re-test their predicate in a loop.
++//
++// The mutex is a semaphore used as a binary lock: value 0 means locked.
++// Semaphores have no owner, so the only misuse we can catch is calling
++// cond_wait() while the mutex is plainly not held (value > 0).
++// ---------------------------------------------------------------------
++
++// int cond_init(void) -> handle, or -1
++uint64
++sys_cond_init(void)
++{
++  struct proc *p = myproc();
++  int i;
++
++  acquire(&condtab.lock);
++  for (i = 0; i < NCOND; i++)
++    if (condtab.c[i].refs == 0)
++      break;
++  if (i == NCOND) {
++    release(&condtab.lock);
++    return -1;
++  }
++  condtab.c[i].refs = 1;
++  release(&condtab.lock);
++
++  p->condmask |= 1UL << i;
++  return i;
++}
++
++// int cond_wait(int cd, int sd) -> 0, or -1
++// Atomically release the mutex sd and sleep on cd; take sd again before
++// returning. On -1 caused by a kill the mutex is not retaken, but a killed
++// process never gets back to user code anyway.
++uint64
++sys_cond_wait(void)
++{
++  struct kcond *c;
++  struct ksem *m;
++  struct waiter w;
++  int cd, sd, r;
++
++  argint(0, &cd);
++  argint(1, &sd);
++  if ((c = condlookup(cd)) == 0 || (m = semlookup(sd)) == 0)
++    return -1;
++
++  acquire(&c->lock);
++  acquire(&m->lock);
++  if (m->value != 0) {
++    // Mutex isn't locked, so the caller can't be holding it.
++    release(&m->lock);
++    release(&c->lock);
++    return -1;
++  }
++
++  // Get on the condvar's queue *before* unlocking the mutex. A signaler
++  // needs the mutex (or at least c->lock, which we hold until we are
++  // asleep), so it can't slip a signal into the gap.
++  wq_enqueue(&c->q, &w, 0);
++
++  // Unlock the mutex: pass it to the first waiter, or raise the counter.
++  if (wq_wake(&m->q, 1) == 0)
++    m->value = 1;
++  release(&m->lock);
++
++  r = wq_block(&w, &c->lock);
++  release(&c->lock);
++  if (r < 0)
++    return -1;
++
++  return semdown(m);
++}
++
++// int cond_signal(int cd) -> 0, or -1. Wakes the longest waiter, if any.
++uint64
++sys_cond_signal(void)
++{
++  struct kcond *c;
++  int cd;
++
++  argint(0, &cd);
++  if ((c = condlookup(cd)) == 0)
++    return -1;
++  acquire(&c->lock);
++  wq_wake(&c->q, 1);
++  release(&c->lock);
++  return 0;
++}
++
++// int cond_broadcast(int cd) -> 0, or -1. Wakes everybody.
++uint64
++sys_cond_broadcast(void)
++{
++  struct kcond *c;
++  int cd;
++
++  argint(0, &cd);
++  if ((c = condlookup(cd)) == 0)
++    return -1;
++  acquire(&c->lock);
++  wq_wake(&c->q, -1);
++  release(&c->lock);
++  return 0;
++}
++
++// int cond_destroy(int cd) -> 0, or -1. Same idea as sem_destroy().
++uint64
++sys_cond_destroy(void)
++{
++  struct proc *p = myproc();
++  int cd;
++
++  argint(0, &cd);
++  if (condlookup(cd) == 0)
++    return -1;
++
++  p->condmask &= ~(1UL << cd);
++  acquire(&condtab.lock);
++  condtab.c[cd].refs--;
++  release(&condtab.lock);
++  return 0;
++}
+diff --git a/kernel/shm.c b/kernel/shm.c
+new file mode 100644
+index 0000000..74fa0fb
+--- /dev/null
++++ b/kernel/shm.c
+@@ -0,0 +1,44 @@
++// shm_map(): memory that survives fork() as the *same* memory.
++//
++// xv6 processes normally share nothing, and there are no threads, so there
++// is no way for two of them to look at one variable. A semaphore without
++// shared data is not much use, so this is the smallest thing that fixes it:
++// a window of pages, just below the trapframe, whose pages are shared by
++// fork() instead of being copied. See shmcopy() in vm.c; the physical pages
++// are reference counted in kalloc.c and go away with the last process that
++// has them mapped (exit, or exec, which starts from a clean image).
++
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++
++// void *shm_map(int npages)
++// Map npages of zeroed shared memory. Returns its address, or -1.
++// Successive calls stack downwards from SHMTOP; the heap is kept below.
++uint64
++sys_shm_map(void)
++{
++  struct proc *p = myproc();
++  uint64 bytes, va;
++  int npages;
++
++  argint(0, &npages);
++  if (npages <= 0 || npages > SHM_MAXPAGES)
++    return -1;
++  bytes = (uint64)npages * PGSIZE;
++  if (p->shmsz + bytes > (uint64)SHM_MAXPAGES * PGSIZE)
++    return -1;
++
++  va = SHMTOP - p->shmsz - bytes;
++  if (va < PGROUNDUP(p->sz)) // would collide with the heap
++    return -1;
++
++  if (shmmap(p->pagetable, va, npages) < 0)
++    return -1;
++  p->shmsz += bytes;
++  return va;
++}
+diff --git a/kernel/spinlock.c b/kernel/spinlock.c
+index 9a6aab1..53293b0 100644
+--- a/kernel/spinlock.c
++++ b/kernel/spinlock.c
+@@ -8,12 +8,34 @@
+ #include "proc.h"
+ #include "defs.h"
+ 
++#define NLOCK_REG 512
++
++static struct spinlock *all_locks[NLOCK_REG];
++static int n_registered_locks = 0;
++
++void
++lock_profiler_register(struct spinlock *lk)
++{
++  for (int i = 0; i < n_registered_locks && i < NLOCK_REG; i++) {
++    if (all_locks[i] == lk)
++      return;
++  }
++  int idx = __atomic_fetch_add(&n_registered_locks, 1, __ATOMIC_SEQ_CST);
++  if (idx < NLOCK_REG) {
++    all_locks[idx] = lk;
++  }
++}
++
+ void
+ initlock(struct spinlock *lk, char *name)
+ {
+   lk->name = name;
+   lk->locked = 0;
+   lk->cpu = 0;
++  lk->n_spins = 0;
++  lk->n_acq = 0;
++  lk->n_contended = 0;
++  lock_profiler_register(lk);
+ }
+ 
+ // Acquire the lock.
+@@ -34,8 +56,16 @@ acquire(struct spinlock *lk)
+   // the C compiler and the processor to not move loads or stores
+   // past this point, to ensure that the critical section's memory
+   // references happen strictly after the lock is acquired.
++  uint64 spins = 0;
+   while (__atomic_exchange_n(&lk->locked, 1, __ATOMIC_ACQUIRE) != 0)
+-    ;
++    spins++;
++
++  // Record lock acquisition statistics. We now hold the lock.
++  lk->n_acq++;
++  if (spins > 0) {
++    lk->n_contended++;
++    lk->n_spins += spins;
++  }
+ 
+   // Record info about lock acquisition for holding() and debugging.
+   lk->cpu = mycpu();
+@@ -114,3 +144,90 @@ pop_off(void)
+   if (c->noff == 0 && c->intena)
+     intr_on();
+ }
++
++// Copy lock profiling statistics to user space.
++// mode:
++//   LOCKSTAT_AGGREGATE (0): aggregate statistics by lock name
++//   LOCKSTAT_RESET     (1): reset counters to 0
++//   LOCKSTAT_RAW       (2): raw per-spinlock statistics
++int
++lock_stat_copy(struct lock_stat *u_stats, int max, int mode)
++{
++  int total = n_registered_locks < NLOCK_REG ? n_registered_locks : NLOCK_REG;
++
++  if (mode & LOCKSTAT_RESET) {
++    for (int i = 0; i < total; i++) {
++      struct spinlock *lk = all_locks[i];
++      if (lk) {
++        lk->n_spins = 0;
++        lk->n_acq = 0;
++        lk->n_contended = 0;
++      }
++    }
++    if (u_stats == 0 || max <= 0)
++      return 0;
++  }
++
++  if (u_stats == 0 || max <= 0)
++    return -1;
++
++  struct proc *p = myproc();
++
++  if (mode & LOCKSTAT_RAW) {
++    int count = 0;
++    for (int i = 0; i < total && count < max; i++) {
++      struct spinlock *lk = all_locks[i];
++      if (!lk || !lk->name)
++        continue;
++      struct lock_stat s;
++      memset(&s, 0, sizeof(s));
++      safestrcpy(s.name, lk->name, sizeof(s.name));
++      s.n_acq = lk->n_acq;
++      s.n_contended = lk->n_contended;
++      s.n_spins = lk->n_spins;
++
++      if (copyout(p->pagetable, p->sz, (uint64)(u_stats + count), (char *)&s, sizeof(s)) < 0)
++        return -1;
++      count++;
++    }
++    return count;
++  } else {
++    #define MAX_LOCK_NAMES 64
++    struct lock_stat agg[MAX_LOCK_NAMES];
++    int nnames = 0;
++    memset(agg, 0, sizeof(agg));
++
++    for (int i = 0; i < total; i++) {
++      struct spinlock *lk = all_locks[i];
++      if (!lk || !lk->name)
++        continue;
++
++      int found = -1;
++      for (int j = 0; j < nnames; j++) {
++        if (strncmp(agg[j].name, lk->name, sizeof(agg[j].name)) == 0) {
++          found = j;
++          break;
++        }
++      }
++      if (found < 0) {
++        if (nnames < MAX_LOCK_NAMES) {
++          found = nnames++;
++          safestrcpy(agg[found].name, lk->name, sizeof(agg[found].name));
++        } else {
++          continue;
++        }
++      }
++      agg[found].n_acq += lk->n_acq;
++      agg[found].n_contended += lk->n_contended;
++      agg[found].n_spins += lk->n_spins;
++    }
++
++    int count = nnames < max ? nnames : max;
++    for (int k = 0; k < count; k++) {
++      if (copyout(p->pagetable, p->sz, (uint64)(u_stats + k), (char *)&agg[k], sizeof(agg[k])) < 0)
++        return -1;
++    }
++    return count;
++  }
++}
++
+diff --git a/kernel/spinlock.h b/kernel/spinlock.h
+index 9c93b42..b515368 100644
+--- a/kernel/spinlock.h
++++ b/kernel/spinlock.h
+@@ -5,4 +5,25 @@ struct spinlock {
+   // For debugging:
+   char *name;      // Name of lock.
+   struct cpu *cpu; // The cpu holding the lock.
++
++  // Lock contention profiling:
++  uint64 n_spins;     // Total spin iterations spent waiting in acquire()
++  uint64 n_acq;       // Total number of acquire() calls
++  uint64 n_contended; // Number of acquires that encountered contention
+ };
++
++#ifndef _LOCK_STAT_DEFINED
++#define _LOCK_STAT_DEFINED
++#define LOCK_NAME_MAX 16
++#define LOCKSTAT_AGGREGATE 0
++#define LOCKSTAT_RESET     1
++#define LOCKSTAT_RAW       2
++
++struct lock_stat {
++  char name[LOCK_NAME_MAX];
++  uint64 n_acq;
++  uint64 n_contended;
++  uint64 n_spins;
++};
++#endif
++
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..d5d5427 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,21 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_sem_init(void);
++extern uint64 sys_sem_wait(void);
++extern uint64 sys_sem_trywait(void);
++extern uint64 sys_sem_post(void);
++extern uint64 sys_sem_getvalue(void);
++extern uint64 sys_sem_destroy(void);
++extern uint64 sys_cond_init(void);
++extern uint64 sys_cond_wait(void);
++extern uint64 sys_cond_signal(void);
++extern uint64 sys_cond_broadcast(void);
++extern uint64 sys_cond_destroy(void);
++extern uint64 sys_futex_wait(void);
++extern uint64 sys_futex_wake(void);
++extern uint64 sys_shm_map(void);
++extern uint64 sys_lockstat(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +145,21 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_sem_init]        = sys_sem_init,
++  [SYS_sem_wait]        = sys_sem_wait,
++  [SYS_sem_trywait]     = sys_sem_trywait,
++  [SYS_sem_post]        = sys_sem_post,
++  [SYS_sem_getvalue]    = sys_sem_getvalue,
++  [SYS_sem_destroy]     = sys_sem_destroy,
++  [SYS_cond_init]       = sys_cond_init,
++  [SYS_cond_wait]       = sys_cond_wait,
++  [SYS_cond_signal]     = sys_cond_signal,
++  [SYS_cond_broadcast]  = sys_cond_broadcast,
++  [SYS_cond_destroy]    = sys_cond_destroy,
++  [SYS_futex_wait]      = sys_futex_wait,
++  [SYS_futex_wake]      = sys_futex_wake,
++  [SYS_shm_map]         = sys_shm_map,
++  [SYS_lockstat]        = sys_lockstat,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..56fe2b2 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,18 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_sem_init       23
++#define SYS_sem_wait       24
++#define SYS_sem_trywait    25
++#define SYS_sem_post       26
++#define SYS_sem_getvalue   27
++#define SYS_sem_destroy    28
++#define SYS_cond_init      29
++#define SYS_cond_wait      30
++#define SYS_cond_signal    31
++#define SYS_cond_broadcast 32
++#define SYS_cond_destroy   33
++#define SYS_futex_wait     34
++#define SYS_futex_wake     35
++#define SYS_shm_map        36
++#define SYS_lockstat       37
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index cd25557..3ba60cd 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -57,7 +57,7 @@ sys_sbrk(void)
+     // memory, vmfault() will allocate it.
+     if (addr + n < addr)
+       return -1;
+-    if (addr + n > TRAPFRAME)
++    if (addr + n > SHMTOP - myproc()->shmsz)
+       return -1;
+     myproc()->sz += n;
+   }
+@@ -110,3 +110,17 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_lockstat(void)
++{
++  uint64 uaddr;
++  int max, mode;
++
++  argaddr(0, &uaddr);
++  argint(1, &max);
++  argint(2, &mode);
++
++  return lock_stat_copy((struct lock_stat *)uaddr, max, mode);
++}
++
+diff --git a/kernel/vm.c b/kernel/vm.c
+index f50650b..3a37d2b 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -489,3 +489,73 @@ ismapped(pagetable_t pagetable, uint64 va)
+   }
+   return 0;
+ }
++
++// Give the process npages of fresh, zeroed, shared memory at va.
++// The pages are flagged PTE_SHM so that fork shares them instead of
++// copying them (see shmcopy). Returns 0, or -1 with nothing left mapped.
++int
++shmmap(pagetable_t pagetable, uint64 va, int npages)
++{
++  int i;
++  char *mem;
++
++  for (i = 0; i < npages; i++) {
++    if ((mem = kalloc()) == 0)
++      goto err;
++    memset(mem, 0, PGSIZE);
++    if (mappages(pagetable, va + i * PGSIZE, PGSIZE, (uint64)mem,
++                 PTE_R | PTE_W | PTE_U | PTE_SHM) != 0) {
++      kfree(mem);
++      goto err;
++    }
++  }
++  return 0;
++
++err:
++  uvmunmap(pagetable, va, i, 1);
++  return -1;
++}
++
++// fork() helper: map the parent's shared window into the child, pointing at
++// the same physical pages (one extra reference each). The window is
++// [SHMTOP - shmsz, SHMTOP) and has no holes by construction.
++// Returns 0, or -1 with the child's part of the window unmapped again.
++int
++shmcopy(pagetable_t old, pagetable_t new, uint64 shmsz)
++{
++  uint64 base = SHMTOP - shmsz;
++  uint64 a, pa;
++  pte_t *pte;
++
++  for (a = base; a < SHMTOP; a += PGSIZE) {
++    pte = walk(old, a, 0);
++    if (pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_SHM) == 0)
++      panic("shmcopy: hole in shared window");
++    pa = PTE2PA(*pte);
++    krefinc((void *)pa);
++    if (mappages(new, a, PGSIZE, pa, PTE_FLAGS(*pte)) != 0) {
++      kfree((void *)pa); // undo the reference taken above
++      goto err;
++    }
++  }
++  return 0;
++
++err:
++  uvmunmap(new, base, (a - base) / PGSIZE, 1);
++  return -1;
++}
++
++// Physical address behind user address va (page offset included), or 0.
++// Faults in a lazily allocated heap page the same way copyin() would.
++// The futex code keys its wait queues on this, so that two processes
++// looking at the same shared word agree on what it is called.
++uint64
++uva2pa(pagetable_t pagetable, uint64 psz, uint64 va)
++{
++  uint64 pa = walkaddr(pagetable, va);
++  if (pa == 0)
++    pa = vmfault(pagetable, psz, va, 1);
++  if (pa == 0)
++    return 0;
++  return pa + (va & (PGSIZE - 1));
++}
+diff --git a/kernel/waitq.c b/kernel/waitq.c
+new file mode 100644
+index 0000000..24a1896
+--- /dev/null
++++ b/kernel/waitq.c
+@@ -0,0 +1,133 @@
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "waitq.h"
++
++// Everything here is called with the lock that protects the queue held.
++// That lock belongs to the caller (the semaphore, the condvar, the futex
++// bucket); waitq.c never takes a lock of its own.
++
++void
++wq_init(struct waitq *q)
++{
++  q->head.next = q->head.prev = &q->head;
++}
++
++int
++wq_empty(struct waitq *q)
++{
++  return q->head.next == &q->head;
++}
++
++// Put w at the tail of q.
++void
++wq_enqueue(struct waitq *q, struct waiter *w, uint64 key)
++{
++  w->key = key;
++  w->signaled = 0;
++  w->prev = q->head.prev;
++  w->next = &q->head;
++  q->head.prev->next = w;
++  q->head.prev = w;
++}
++
++static void
++wq_unlink(struct waiter *w)
++{
++  w->prev->next = w->next;
++  w->next->prev = w->prev;
++  w->prev = w->next = 0;
++}
++
++// Take w off its queue, mark it, and make its process runnable.
++static void
++wq_signal(struct waiter *w)
++{
++  wq_unlink(w);
++  w->signaled = 1;
++  wakeup(w);
++}
++
++// Block the calling process until another process signals w.
++// w must already be on a queue, and lk (the lock protecting that queue)
++// must be held. lk is released while we sleep and held again on return.
++//
++// Returns 0 once w was signaled, or -1 if the process was killed first
++// (w is off the queue in both cases).
++//
++// This is sleep() written out by hand, with one addition. kill() only
++// wakes a process that is already SLEEPING. If the kill lands after we
++// let go of lk but before we are asleep, plain sleep() would go to sleep
++// anyway and the process would stay blocked until the next real wakeup,
++// possibly forever. So we look at p->killed with p->lock held, the same
++// lock kill() takes, and refuse to sleep if the flag is already up.
++int
++wq_block(struct waiter *w, struct spinlock *lk)
++{
++  struct proc *p = myproc();
++  int dying;
++
++  while (!w->signaled) {
++    acquire(&p->lock);
++    release(lk);
++
++    dying = p->killed;
++    if (!dying) {
++      p->chan = w;
++      p->state = SLEEPING;
++      sched();
++      p->chan = 0;
++      dying = p->killed;
++    }
++
++    release(&p->lock);
++    acquire(lk);
++
++    // A wakeup that raced with the kill wins: the waker already took us
++    // off the queue and handed us whatever we were waiting for.
++    if (dying && !w->signaled) {
++      wq_unlink(w);
++      return -1;
++    }
++  }
++  return 0;
++}
++
++// Wake the first n waiters, in arrival order. n < 0 means everybody.
++// Returns how many were woken.
++int
++wq_wake(struct waitq *q, int n)
++{
++  int woken = 0;
++
++  while (n != 0 && !wq_empty(q)) {
++    wq_signal(q->head.next);
++    woken++;
++    if (n > 0)
++      n--;
++  }
++  return woken;
++}
++
++// Same, but only for waiters whose key matches (futexes share buckets).
++int
++wq_wake_key(struct waitq *q, uint64 key, int n)
++{
++  struct waiter *w, *next;
++  int woken = 0;
++
++  for (w = q->head.next; w != &q->head && n != 0; w = next) {
++    next = w->next; // wq_signal() unlinks w
++    if (w->key == key) {
++      wq_signal(w);
++      woken++;
++      if (n > 0)
++        n--;
++    }
++  }
++  return woken;
++}
+diff --git a/kernel/waitq.h b/kernel/waitq.h
+new file mode 100644
+index 0000000..8780a1c
+--- /dev/null
++++ b/kernel/waitq.h
+@@ -0,0 +1,26 @@
++// FIFO wait queues, the common plumbing under semaphores, condition
++// variables and futexes (see waitq.c).
++//
++// A waiter node lives on the kernel stack of the process that is blocked,
++// so it costs nothing to allocate and can never run out. The price is that
++// it must be off the queue before the blocking function returns. wq_block()
++// and the wake functions take care of that.
++
++struct spinlock;
++
++struct waiter {
++  struct waiter *prev, *next;
++  uint64 key;     // for the owner of the queue; futexes store the word's PA
++  int signaled;   // set by whoever wakes us. This is the wakeup condition.
++};
++
++struct waitq {
++  struct waiter head; // circular list, head is the sentinel
++};
++
++void wq_init(struct waitq *);
++int  wq_empty(struct waitq *);
++void wq_enqueue(struct waitq *, struct waiter *, uint64 key);
++int  wq_block(struct waiter *, struct spinlock *);
++int  wq_wake(struct waitq *, int n);
++int  wq_wake_key(struct waitq *, uint64 key, int n);
+diff --git a/test-p5.py b/test-p5.py
+new file mode 100755
+index 0000000..af0cfe7
+--- /dev/null
++++ b/test-p5.py
+@@ -0,0 +1,63 @@
++#!/usr/bin/env python3
++# Boot xv6 under qemu, type some commands at the shell, show what came back.
++#
++#   ./test-p5.py p5test                 run the whole suite
++#   ./test-p5.py "semtest" "philo order"   run these, in order
++#
++# Exit status is 0 only if every command printed its PASS line.
++# CPUS=1 ./test-p5.py ...  runs on a single hart.
++
++import os, subprocess, sys, time, select, re
++
++CPUS = os.environ.get("CPUS", "3")
++TIMEOUT = int(os.environ.get("TIMEOUT", "240"))
++
++def main():
++    cmds = sys.argv[1:] or ["p5test"]
++    q = subprocess.Popen(
++        ["make", "-s", "qemu", "CPUS=" + CPUS],
++        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
++        bufsize=0)
++    buf = b""
++    def pump(until, limit):
++        nonlocal buf
++        end = time.time() + limit
++        while time.time() < end:
++            r, _, _ = select.select([q.stdout], [], [], 0.2)
++            if r:
++                d = os.read(q.stdout.fileno(), 4096)
++                if not d:
++                    return False
++                buf += d
++                sys.stdout.write(d.decode(errors="replace"))
++                sys.stdout.flush()
++                if until in buf:
++                    return True
++        return False
++
++    ok = pump(b"init: starting sh", 60) and pump(b"$ ", 30)
++    if not ok:
++        print("\n*** xv6 did not boot")
++        q.kill()
++        return 2
++    status = 0
++    for c in cmds:
++        buf = b""
++        q.stdin.write(c.encode() + b"\n")
++        q.stdin.flush()
++        if not pump(b"\n$ ", TIMEOUT):
++            print("\n*** timeout waiting for: " + c)
++            status = 1
++            break
++        if b"PASS" not in buf or b"FAIL" in buf or b"panic" in buf:
++            status = 1
++    q.stdin.write(b"\x01x")
++    q.stdin.flush()
++    try:
++        q.wait(timeout=5)
++    except subprocess.TimeoutExpired:
++        q.kill()
++    print("\n=== %s ===" % ("PASSED" if status == 0 else "FAILED"))
++    return status
++
++sys.exit(main())
+diff --git a/user/condtest.c b/user/condtest.c
+new file mode 100644
+index 0000000..b7db92a
+--- /dev/null
++++ b/user/condtest.c
+@@ -0,0 +1,219 @@
++// Unit tests for the kernel condition variables.
++// The mutex is a binary semaphore, as cond_wait() expects.
++
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++#include "user/ptest.h"
++
++static int *sh;   // sh[0] woken, sh[1] log position, sh[2..] log, sh[40] ping-pong turn
++
++static int mu, cv; // handles, inherited by the children
++
++static void
++waiter(int id)
++{
++  if (sem_wait(mu) < 0)
++    exit(1);
++  // predicate: sh[3] != 0, set by the parent. Loop because of Mesa semantics.
++  while (sh[3] == 0)
++    if (cond_wait(cv, mu) < 0)
++      exit(1);
++  int slot = __atomic_fetch_add(&sh[1], 1, __ATOMIC_SEQ_CST);
++  sh[8 + slot] = id;
++  __atomic_fetch_add(&sh[0], 1, __ATOMIC_SEQ_CST);
++  sem_post(mu);
++}
++
++// Variant where a signal consumes the predicate, so that exactly one
++// waiter can proceed per signal.
++static void
++ticket_waiter(int id)
++{
++  if (sem_wait(mu) < 0)
++    exit(1);
++  while (sh[3] == 0)
++    if (cond_wait(cv, mu) < 0)
++      exit(1);
++  sh[3]--;
++  int slot = __atomic_fetch_add(&sh[1], 1, __ATOMIC_SEQ_CST);
++  sh[8 + slot] = id;
++  __atomic_fetch_add(&sh[0], 1, __ATOMIC_SEQ_CST);
++  sem_post(mu);
++}
++
++static void
++reset(void)
++{
++  sh[0] = sh[1] = sh[3] = 0;
++}
++
++static void
++test_misuse(void)
++{
++  int m = sem_init(1), c = cond_init();
++  CHECK(c >= 0 && m >= 0, "init");
++  CHECK(cond_wait(c, m) == -1, "cond_wait with an unlocked mutex is refused");
++  CHECK(cond_wait(-1, m) == -1, "bad condvar handle");
++  CHECK(cond_wait(c, 99) == -1, "bad mutex handle");
++  CHECK(cond_signal(NCOND) == -1, "signal on bad handle");
++  CHECK(cond_broadcast(-3) == -1, "broadcast on bad handle");
++  CHECK(cond_signal(c) == 0, "signal with nobody waiting is fine");
++  CHECK(cond_destroy(c) == 0, "destroy");
++  CHECK(cond_destroy(c) == -1, "destroy twice");
++  CHECK(cond_signal(c) == -1, "signal after destroy");
++  sem_destroy(m);
++}
++
++static void
++test_table_full(void)
++{
++  int h[NCOND + 1], n = 0, i;
++  while (n <= NCOND && (h[n] = cond_init()) >= 0)
++    n++;
++  CHECK(n == NCOND, "exactly NCOND condvars");
++  for (i = 0; i < n; i++)
++    cond_destroy(h[i]);
++  CHECK((h[0] = cond_init()) >= 0, "slot free again");
++  cond_destroy(h[0]);
++}
++
++static void
++test_signal_one(void)
++{
++  int i;
++  mu = sem_init(1);
++  cv = cond_init();
++  reset();
++  for (i = 0; i < 3; i++) {
++    spawn(ticket_waiter, i);
++    nap(2); // arrival order 0, 1, 2
++  }
++  CHECK(sh[0] == 0, "nobody got through yet");
++
++  for (i = 1; i <= 3; i++) {
++    sem_wait(mu);
++    sh[3] = 1;                  // one ticket
++    cond_signal(cv);
++    sem_post(mu);
++    nap(2);
++    CHECK(sh[0] == i, "each signal releases exactly one waiter");
++  }
++  CHECK(reap() == 0, "waiters finished");
++  for (i = 0; i < 3; i++)
++    CHECK(sh[8 + i] == i, "signals wake the oldest waiter first");
++  sem_destroy(mu);
++  cond_destroy(cv);
++}
++
++static void
++test_broadcast(void)
++{
++  int i;
++  mu = sem_init(1);
++  cv = cond_init();
++  reset();
++  for (i = 0; i < 5; i++)
++    spawn(waiter, i);
++  nap(4);
++  CHECK(sh[0] == 0, "all five are asleep");
++  sem_wait(mu);
++  sh[3] = 1;
++  cond_broadcast(cv);
++  sem_post(mu);
++  watchdog(100);
++  CHECK(reap() == 0, "waiters finished");
++  CHECK(sh[0] == 5, "broadcast woke everybody");
++  CHECK(sem_getvalue(mu) == 1, "mutex is free at the end");
++  sem_destroy(mu);
++  cond_destroy(cv);
++}
++
++static void
++test_signal_not_remembered(void)
++{
++  mu = sem_init(1);
++  cv = cond_init();
++  reset();
++  // a signal nobody hears is gone; it must not wake a later waiter
++  cond_signal(cv);
++  spawn(ticket_waiter, 0);
++  nap(3);
++  CHECK(sh[0] == 0, "late waiter still blocked");
++  sem_wait(mu);
++  sh[3] = 1;
++  cond_signal(cv);
++  sem_post(mu);
++  watchdog(100);
++  CHECK(reap() == 0, "waiter finished");
++  CHECK(sh[0] == 1, "and the real signal woke it");
++  sem_destroy(mu);
++  cond_destroy(cv);
++}
++
++static void
++test_kill_waiter(void)
++{
++  mu = sem_init(1);
++  cv = cond_init();
++  reset();
++  int pid = spawn(waiter, 0);
++  nap(3);
++  CHECK(sem_getvalue(mu) == 1, "cond_wait gave the mutex back");
++  CHECK(kill_and_wait(pid) == -1, "killed");
++  // dead waiter must be off the queue: a broadcast must not trip on it
++  CHECK(cond_broadcast(cv) == 0, "broadcast after the kill");
++  CHECK(sem_trywait(mu) == 0, "mutex is still usable");
++  sem_post(mu);
++  sem_destroy(mu);
++  cond_destroy(cv);
++}
++
++// two processes take turns through one condvar; any lost wakeup hangs
++static void
++pinger(int me)
++{
++  for (int i = 0; i < 300; i++) {
++    sem_wait(mu);
++    while (sh[40] != me)
++      cond_wait(cv, mu);
++    sh[41]++;
++    sh[40] = 1 - me;
++    cond_broadcast(cv);
++    sem_post(mu);
++  }
++}
++
++static void
++test_pingpong(void)
++{
++  mu = sem_init(1);
++  cv = cond_init();
++  sh[40] = 0;
++  sh[41] = 0;
++  spawn(pinger, 0);
++  spawn(pinger, 1);
++  watchdog(300);
++  CHECK(reap() == 0, "both finished");
++  CHECK(sh[41] == 600, "every turn was taken");
++  sem_destroy(mu);
++  cond_destroy(cv);
++}
++
++#define RUN(t) do { printf("  %s ... ", #t); t(); printf("ok\n"); } while (0)
++
++int
++main(void)
++{
++  sh = shm_ints(1);
++  printf("condtest\n");
++  RUN(test_misuse);
++  RUN(test_table_full);
++  RUN(test_signal_one);
++  RUN(test_broadcast);
++  RUN(test_signal_not_remembered);
++  RUN(test_kill_waiter);
++  RUN(test_pingpong);
++  printf("condtest: PASS\n");
++  exit(0);
++}
+diff --git a/user/futextest.c b/user/futextest.c
+new file mode 100644
+index 0000000..3e973e2
+--- /dev/null
++++ b/user/futextest.c
+@@ -0,0 +1,222 @@
++// Unit tests for futex_wait/futex_wake and the futex-based user library.
++
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++#include "user/usync.h"
++#include "user/ptest.h"
++
++static int *w;   // futex words live in shared memory
++static int priv; // a private word, to show that keys are physical
++
++static void
++sleeper(int id)
++{
++  int r = futex_wait(&w[0], 0);
++  if (r != 0)
++    exit(1);
++  int slot = __atomic_fetch_add(&w[1], 1, __ATOMIC_SEQ_CST);
++  w[2 + slot] = id;
++}
++
++static void
++test_errors(void)
++{
++  w[0] = 5;
++  CHECK(futex_wait(&w[0], 4) == 1, "value mismatch returns at once");
++  CHECK(futex_wait((int *)((char *)&w[0] + 1), 5) == -1, "unaligned address");
++  CHECK(futex_wait((int *)0x3fffff0000L, 0) == -1, "unmapped address");
++  CHECK(futex_wait((int *)0x80000000L, 0) == -1, "kernel address");
++  CHECK(futex_wake((int *)((char *)&w[0] + 2), 1) == -1, "unaligned wake");
++  CHECK(futex_wake((int *)0x3fffff0000L, 1) == -1, "wake on unmapped address");
++  CHECK(futex_wake(&w[0], 1) == 0, "wake with nobody asleep");
++  CHECK(futex_wake(&w[0], -1) == 0, "wake all with nobody asleep");
++}
++
++static void
++test_wake_counts(void)
++{
++  int i;
++  w[0] = 0;
++  w[1] = 0;
++  for (i = 0; i < 5; i++) {
++    spawn(sleeper, i);
++    nap(2);
++  }
++  CHECK(futex_wake(&w[0], 1) == 1, "wake(1) wakes one");
++  nap(2);
++  CHECK(w[1] == 1, "one process ran");
++  CHECK(futex_wake(&w[0], 2) == 2, "wake(2) wakes two");
++  nap(2);
++  CHECK(w[1] == 3, "three have run");
++  CHECK(futex_wake(&w[0], 0) == 0, "wake(0) wakes nobody");
++  CHECK(futex_wake(&w[0], 100) == 2, "wake(100) wakes the rest, and reports 2");
++  CHECK(reap() == 0, "sleepers finished");
++  for (i = 0; i < 5; i++)
++    CHECK(w[2 + i] == i, "woken oldest first");
++  CHECK(futex_wake(&w[0], 1) == 0, "queue is empty now");
++}
++
++static void
++test_other_word(void)
++{
++  // different word in the same page: must not be woken by a wake on its neighbour
++  w[0] = 0;
++  w[1] = 0;
++  int pid = spawn(sleeper, 7);
++  nap(2);
++  CHECK(futex_wake(&w[16], 1) == 0, "wake on a different word hits nothing");
++  nap(1);
++  CHECK(w[1] == 0, "sleeper is still asleep");
++  CHECK(futex_wake(&w[0], 1) == 1, "wake on its own word works");
++  CHECK(reap() == 0, "sleeper finished");
++  (void)pid;
++}
++
++static void
++private_sleeper(int arg)
++{
++  priv = 0;
++  futex_wait(&priv, 0);
++  exit(5); // reached only if somebody wakes us
++}
++
++static void
++test_private_is_private(void)
++{
++  // Child sleeps on &priv in its own address space. We have a variable at
++  // the same virtual address, but it's a different physical page.
++  int pid = spawn(private_sleeper, 0);
++  nap(2);
++  CHECK(futex_wake(&priv, 10) == 0, "same VA, other process: not the same futex");
++  CHECK(kill_and_wait(pid) == -1, "sleeper was still asleep, and dies on kill");
++}
++
++static void
++test_kill_sleeper(void)
++{
++  w[0] = 0;
++  w[1] = 0;
++  int pid = spawn(sleeper, 1);
++  nap(2);
++  CHECK(kill_and_wait(pid) == -1, "killed");
++  CHECK(futex_wake(&w[0], 10) == 0, "dead sleeper is not on the queue any more");
++}
++
++static void
++parent_wakes_child_side(int arg)
++{
++  // child sets the word and wakes the parent
++  nap(2);
++  __atomic_store_n(&w[0], 1, __ATOMIC_SEQ_CST);
++  futex_wake(&w[0], 1);
++}
++
++static void
++test_cross_process(void)
++{
++  w[0] = 0;
++  spawn(parent_wakes_child_side, 0);
++  while (__atomic_load_n(&w[0], __ATOMIC_SEQ_CST) == 0)
++    futex_wait(&w[0], 0);
++  CHECK(reap() == 0, "child finished");
++}
++
++static fmutex_t *fm;
++static int *count;
++
++static void
++fm_worker(int arg)
++{
++  for (int i = 0; i < 500; i++) {
++    fmutex_lock(fm);
++    int t = *count;
++    spin(10);
++    *count = t + 1;
++    fmutex_unlock(fm);
++  }
++}
++
++static void
++test_fmutex(void)
++{
++  int i;
++  *count = 0;
++  for (i = 0; i < 4; i++)
++    spawn(fm_worker, 0);
++  watchdog(300);
++  CHECK(reap() == 0, "workers finished");
++  CHECK(*count == 2000, "futex mutex: no lost updates");
++  CHECK(fmutex_trylock(fm) == 0, "trylock on a free mutex");
++  CHECK(fmutex_trylock(fm) == -1, "trylock on a held mutex");
++  fmutex_unlock(fm);
++}
++
++static fcond_t *fc;
++
++static void
++fc_producer(int arg)
++{
++  for (int i = 1; i <= 400; i++) {
++    fmutex_lock(fm);
++    while (count[1] != 0)       // one-slot mailbox
++      fcond_wait(fc, fm);
++    count[1] = i;
++    fcond_broadcast(fc);
++    fmutex_unlock(fm);
++  }
++}
++
++static void
++fc_consumer(int arg)
++{
++  long sum = 0;
++  for (int i = 1; i <= 400; i++) {
++    fmutex_lock(fm);
++    while (count[1] == 0)
++      fcond_wait(fc, fm);
++    sum += count[1];
++    count[1] = 0;
++    fcond_broadcast(fc);
++    fmutex_unlock(fm);
++  }
++  count[2] = (int)sum;
++}
++
++static void
++test_fcond(void)
++{
++  count[1] = 0;
++  count[2] = 0;
++  spawn(fc_producer, 0);
++  spawn(fc_consumer, 0);
++  watchdog(300);
++  CHECK(reap() == 0, "both finished");
++  CHECK(count[2] == 400 * 401 / 2, "mailbox handed over every value exactly once");
++}
++
++#define RUN(t) do { printf("  %s ... ", #t); t(); printf("ok\n"); } while (0)
++
++int
++main(void)
++{
++  char *mem = (char *)shm_ints(1);
++  w = (int *)mem;                              // first half: futex words
++  fm = (fmutex_t *)(mem + 2048);
++  fc = (fcond_t *)(mem + 2048 + 64);
++  count = (int *)(mem + 2048 + 128);
++  fmutex_init(fm);
++  fcond_init(fc);
++
++  printf("futextest\n");
++  RUN(test_errors);
++  RUN(test_wake_counts);
++  RUN(test_other_word);
++  RUN(test_private_is_private);
++  RUN(test_kill_sleeper);
++  RUN(test_cross_process);
++  RUN(test_fmutex);
++  RUN(test_fcond);
++  printf("futextest: PASS\n");
++  exit(0);
++}
+diff --git a/user/hotlocks.c b/user/hotlocks.c
+new file mode 100644
+index 0000000..7b518e9
+--- /dev/null
++++ b/user/hotlocks.c
+@@ -0,0 +1,233 @@
++// Kernel lock-contention profiler CLI and analysis tool.
++//
++// Usage:
++//   hotlocks                  run multi-core benchmark and find hot locks
++//   hotlocks dump             display current lock stats without resetting
++//   hotlocks raw              display per-spinlock unaggregated stats
++//   hotlocks reset            reset all lock contention counters
++//   hotlocks <prog> [args...] profile a specific command (e.g. hotlocks p5test)
++
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "kernel/stat.h"
++#include "kernel/fcntl.h"
++#include "user/user.h"
++
++#define MAX_ENTRIES 64
++
++static void
++print_stat_row(struct lock_stat *s)
++{
++  uint64 cont_pct_int = 0;
++  uint64 cont_pct_frac = 0;
++  uint64 avg_spin_int = 0;
++  uint64 avg_spin_frac = 0;
++
++  if (s->n_acq > 0) {
++    uint64 pct10 = (s->n_contended * 1000) / s->n_acq;
++    cont_pct_int = pct10 / 10;
++    cont_pct_frac = pct10 % 10;
++  }
++  if (s->n_contended > 0) {
++    uint64 avg10 = (s->n_spins * 10) / s->n_contended;
++    avg_spin_int = avg10 / 10;
++    avg_spin_frac = avg10 % 10;
++  }
++
++  // Format columns: Name (12) | Acquires (10) | Contended (10) | Cont% (7) | Total Spins (12) | Avg Spins/Cont (14)
++  printf("%s", s->name);
++  int len = strlen(s->name);
++  for (int i = len; i < 14; i++)
++    printf(" ");
++
++  printf("%d", (int)s->n_acq);
++  // Pad acquisitions
++  int acq_digits = 1;
++  uint64 t = s->n_acq;
++  while (t >= 10) { acq_digits++; t /= 10; }
++  for (int i = acq_digits; i < 12; i++) printf(" ");
++
++  printf("%d", (int)s->n_contended);
++  int cont_digits = 1;
++  t = s->n_contended;
++  while (t >= 10) { cont_digits++; t /= 10; }
++  for (int i = cont_digits; i < 12; i++) printf(" ");
++
++  printf("%d.%d%%", (int)cont_pct_int, (int)cont_pct_frac);
++  int pct_len = 4 + (cont_pct_int >= 10 ? 1 : 0) + (cont_pct_int >= 100 ? 1 : 0);
++  for (int i = pct_len; i < 10; i++) printf(" ");
++
++  printf("%d", (int)s->n_spins);
++  int spin_digits = 1;
++  t = s->n_spins;
++  while (t >= 10) { spin_digits++; t /= 10; }
++  for (int i = spin_digits; i < 14; i++) printf(" ");
++
++  printf("%d.%d\n", (int)avg_spin_int, (int)avg_spin_frac);
++}
++
++static void
++sort_stats(struct lock_stat *stats, int n)
++{
++  for (int i = 0; i < n - 1; i++) {
++    for (int j = 0; j < n - i - 1; j++) {
++      if (stats[j].n_spins < stats[j + 1].n_spins ||
++          (stats[j].n_spins == stats[j + 1].n_spins && stats[j].n_contended < stats[j + 1].n_contended)) {
++        struct lock_stat tmp = stats[j];
++        stats[j] = stats[j + 1];
++        stats[j + 1] = tmp;
++      }
++    }
++  }
++}
++
++static void
++display_stats(int mode)
++{
++  struct lock_stat stats[MAX_ENTRIES];
++  int n = lockstat(stats, MAX_ENTRIES, mode);
++  if (n < 0) {
++    printf("hotlocks: lockstat failed\n");
++    return;
++  }
++
++  sort_stats(stats, n);
++
++  printf("\n======================== XV6 LOCK CONTENTION PROFILER ========================\n");
++  printf("LOCK NAME     ACQUIRES    CONTENDED   CONT RATE   TOTAL SPINS   AVG SPINS/CONT\n");
++  printf("------------------------------------------------------------------------------\n");
++
++  int hot_count = 0;
++  for (int i = 0; i < n; i++) {
++    if (stats[i].n_acq > 0 || stats[i].n_spins > 0) {
++      print_stat_row(&stats[i]);
++      if (stats[i].n_spins > 0)
++        hot_count++;
++    }
++  }
++  printf("------------------------------------------------------------------------------\n");
++
++  printf("\n=== Analysis of Hot Locks in xv6 ===\n");
++  for (int i = 0; i < n && i < 4; i++) {
++    if (stats[i].n_spins == 0)
++      continue;
++    if (strcmp(stats[i].name, "kmem") == 0) {
++      printf("[*] 'kmem' (Memory Allocator): Heavy contention due to single global freelist lock.\n"
++             "    Concurrent page allocations (fork, exec, sbrk) on multiple CPUs fight for this lock.\n");
++    } else if (strcmp(stats[i].name, "bcache") == 0) {
++      printf("[*] 'bcache' (Buffer Cache): Contention from concurrent block reads/writes.\n"
++             "    A single lock protects all buffer headers and the LRU list.\n");
++    } else if (strcmp(stats[i].name, "wait_lock") == 0 || strcmp(stats[i].name, "proc") == 0) {
++      printf("[*] '%s' (Process Management): Contention during concurrent fork/exit/wait\n"
++             "    and process table state transitions.\n", stats[i].name);
++    } else if (strcmp(stats[i].name, "futex") == 0 || strcmp(stats[i].name, "sem") == 0 || strcmp(stats[i].name, "semtab") == 0) {
++      printf("[*] '%s' (Sync Primitives): Contention from concurrent waiter queues.\n", stats[i].name);
++    }
++  }
++  if (hot_count == 0) {
++    printf("(No lock spin contention observed in this run - single CPU or uncontended locks)\n");
++  }
++  printf("==============================================================================\n\n");
++}
++
++static void
++run_stress_workload(void)
++{
++  int nworkers = 4;
++  printf("hotlocks: running multi-core workload across %d worker processes...\n", nworkers);
++
++  for (int w = 0; w < nworkers; w++) {
++    int pid = fork();
++    if (pid < 0) {
++      printf("hotlocks: fork failed\n");
++      exit(1);
++    }
++    if (pid == 0) {
++      // Workload 1: Memory allocator stress (kmem lock)
++      for (int i = 0; i < 300; i++) {
++        char *p = sbrk(4096);
++        if (p != (char *)-1) {
++          p[0] = (char)i;
++          sbrk(-4096);
++        }
++      }
++
++      // Workload 2: Filesystem buffer cache stress (bcache / itable)
++      char fname[16];
++      fname[0] = 'l'; fname[1] = 'k'; fname[2] = '0' + w; fname[3] = '\0';
++      for (int i = 0; i < 20; i++) {
++        int fd = open(fname, O_CREATE | O_RDWR);
++        if (fd >= 0) {
++          write(fd, "test", 4);
++          close(fd);
++          unlink(fname);
++        }
++      }
++
++      // Workload 3: Short fork/exit (proc and wait_lock)
++      for (int i = 0; i < 8; i++) {
++        int k = fork();
++        if (k == 0) exit(0);
++        wait(0);
++      }
++
++      exit(0);
++    }
++  }
++
++  for (int w = 0; w < nworkers; w++) {
++    wait(0);
++  }
++  printf("hotlocks: workload completed.\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++  if (argc == 2 && strcmp(argv[1], "reset") == 0) {
++    if (lockstat(0, 0, LOCKSTAT_RESET) == 0)
++      printf("hotlocks: lock contention counters reset to zero.\n");
++    else
++      printf("hotlocks: reset failed.\n");
++    exit(0);
++  }
++
++  if (argc == 2 && strcmp(argv[1], "dump") == 0) {
++    display_stats(LOCKSTAT_AGGREGATE);
++    exit(0);
++  }
++
++  if (argc == 2 && strcmp(argv[1], "raw") == 0) {
++    display_stats(LOCKSTAT_RAW);
++    exit(0);
++  }
++
++  if (argc >= 2) {
++    // Run custom command with profiling
++    printf("hotlocks: resetting counters and profiling command '%s'...\n", argv[1]);
++    lockstat(0, 0, LOCKSTAT_RESET);
++
++    int pid = fork();
++    if (pid < 0) {
++      printf("hotlocks: fork failed\n");
++      exit(1);
++    }
++    if (pid == 0) {
++      exec(argv[1], &argv[1]);
++      printf("hotlocks: cannot exec %s\n", argv[1]);
++      exit(1);
++    }
++    int status = 0;
++    wait(&status);
++    printf("\nhotlocks: target program exited with status %d\n", status);
++    display_stats(LOCKSTAT_AGGREGATE);
++    exit(status);
++  }
++
++  // Default: reset, run workload, show hot locks
++  lockstat(0, 0, LOCKSTAT_RESET);
++  run_stress_workload();
++  display_stats(LOCKSTAT_AGGREGATE);
++  printf("hotlocks: PASS\n");
++  exit(0);
++}
+diff --git a/user/locktest.c b/user/locktest.c
+new file mode 100644
+index 0000000..a4bf6c4
+--- /dev/null
++++ b/user/locktest.c
+@@ -0,0 +1,85 @@
++// Unit tests for the kernel lock-contention profiler system call (lockstat).
++
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++#include "user/ptest.h"
++
++static void
++test_bad_args(void)
++{
++  CHECK(lockstat(0, 0, 0) == -1, "null pointer without reset flag returns -1");
++  CHECK(lockstat((void *)-1, 10, 0) == -1, "invalid pointer returns -1");
++  CHECK(lockstat((void *)0x1, 10, 0) == -1, "unaligned bad pointer returns -1");
++}
++
++static void
++test_reset_and_read(void)
++{
++  struct lock_stat stats[32];
++
++  CHECK(lockstat(0, 0, LOCKSTAT_RESET) == 0, "reset counters succeeds");
++
++  int n = lockstat(stats, 32, LOCKSTAT_AGGREGATE);
++  CHECK(n > 0, "aggregated read returns entries");
++
++  int found_named = 0;
++  for (int i = 0; i < n; i++) {
++    if (strlen(stats[i].name) > 0)
++      found_named++;
++  }
++  CHECK(found_named > 0, "found valid lock names");
++}
++
++static void
++worker_contention(int id)
++{
++  // Allocate and free memory rapidly to hammer kmem.lock
++  for (int i = 0; i < 200; i++) {
++    char *p = sbrk(4096);
++    if (p != SBRK_ERROR) {
++      p[0] = (char)id;
++      sbrk(-4096);
++    }
++  }
++}
++
++static void
++test_contention_capture(void)
++{
++  struct lock_stat stats[32];
++
++  // Reset counters
++  CHECK(lockstat(0, 0, LOCKSTAT_RESET) == 0, "reset before workload");
++
++  // Spawn concurrent workers to generate real lock contention on kmem
++  for (int i = 0; i < 4; i++) {
++    spawn(worker_contention, i);
++  }
++  reap();
++
++  int n = lockstat(stats, 32, LOCKSTAT_AGGREGATE);
++  CHECK(n > 0, "read stats after workload");
++
++  uint64 total_acq = 0;
++  for (int i = 0; i < n; i++) {
++    total_acq += stats[i].n_acq;
++  }
++  CHECK(total_acq > 0, "acquisitions recorded during workload");
++
++  // Raw per-spinlock mode check
++  struct lock_stat raw_stats[64];
++  int nraw = lockstat(raw_stats, 64, LOCKSTAT_RAW);
++  CHECK(nraw > 0, "raw mode returns individual lock entries");
++}
++
++int
++main(void)
++{
++  test_bad_args();
++  test_reset_and_read();
++  test_contention_capture();
++
++  printf("locktest: PASS\n");
++  exit(0);
++}
+diff --git a/user/p5test.c b/user/p5test.c
+new file mode 100644
+index 0000000..dfecc4d
+--- /dev/null
++++ b/user/p5test.c
+@@ -0,0 +1,48 @@
++// Runs the whole project 5 suite, one program after the other, and says
++// at the end whether everything passed.
++
++#include "kernel/types.h"
++#include "user/user.h"
++
++static char *suite[][4] = {
++  { "semtest", 0 },
++  { "condtest", 0 },
++  { "futextest", 0 },
++  { "shmtest", 0 },
++  { "pcbuf", 0 },
++  { "rwlock", 0 },
++  { "philo", 0 },
++  { "philo", "naive", 0 },
++  { "locktest", 0 },
++};
++
++int
++main(void)
++{
++  int n = sizeof(suite) / sizeof(suite[0]), failed = 0;
++
++  for (int i = 0; i < n; i++) {
++    int pid = fork();
++    if (pid < 0) {
++      printf("p5test: fork failed\n");
++      exit(1);
++    }
++    if (pid == 0) {
++      exec(suite[i][0], suite[i]);
++      printf("p5test: cannot exec %s\n", suite[i][0]);
++      exit(1);
++    }
++    int st;
++    wait(&st);
++    if (st != 0) {
++      printf("p5test: %s exited with status %d\n", suite[i][0], st);
++      failed++;
++    }
++  }
++
++  if (failed)
++    printf("p5test: %d of %d programs did not pass\n", failed, n);
++  else
++    printf("p5test: PASS (all %d programs)\n", n);
++  exit(failed != 0);
++}
+diff --git a/user/pcbuf.c b/user/pcbuf.c
+new file mode 100644
+index 0000000..f8793f2
+--- /dev/null
++++ b/user/pcbuf.c
+@@ -0,0 +1,249 @@
++// Producer-consumer with a bounded buffer, solved three ways:
++//
++//   sem     three semaphores: empty slots, full slots, and a mutex
++//   cond    kernel condition variables (not-full, not-empty) + a semaphore mutex
++//   futex   the same shape on the user-level futex mutex and condvar
++//
++//   pcbuf                         all three with the defaults
++//   pcbuf sem|cond|futex [producers [consumers [items-per-producer]]]
++//
++// The buffer is deliberately tiny (4 slots) so that producers really have
++// to wait for consumers and the other way round. Every item has a unique
++// id; at the end each id must have been consumed exactly once, and each
++// consumer must have seen the items of one producer in increasing order.
++
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/usync.h"
++#include "user/ptest.h"
++
++#define BUFSZ    4
++#define MAXITEMS 1500
++#define MAXPROD  8
++
++struct shared {
++  int buf[BUFSZ];
++  int in, out, count;
++  int maxcount;           // fullest the buffer ever got
++  int seen[MAXITEMS];     // times each item id has been consumed
++  fmutex_t fm;            // futex mode only
++  fcond_t fnotfull, fnotempty;
++};
++
++static struct shared *S;
++static int mode;                 // 0 sem, 1 cond, 2 futex
++static int nprod, ncons, per_prod, per_cons;
++static int empty_s, full_s, mutex_s, notfull_c, notempty_c;
++
++// These two run with the buffer lock held, whatever kind of lock it is.
++static void
++buf_put(int item)
++{
++  S->buf[S->in] = item;
++  S->in = (S->in + 1) % BUFSZ;
++  S->count++;
++  CHECK(S->count <= BUFSZ, "buffer overflow");
++  if (S->count > S->maxcount)
++    S->maxcount = S->count;
++}
++
++static int
++buf_get(void)
++{
++  int item;
++
++  CHECK(S->count > 0, "buffer underflow");
++  item = S->buf[S->out];
++  S->out = (S->out + 1) % BUFSZ;
++  S->count--;
++  return item;
++}
++
++static void
++produce(int item)
++{
++  switch (mode) {
++  case 0:
++    sem_wait(empty_s);
++    sem_wait(mutex_s);
++    buf_put(item);
++    sem_post(mutex_s);
++    sem_post(full_s);
++    break;
++  case 1:
++    sem_wait(mutex_s);
++    while (S->count == BUFSZ)
++      cond_wait(notfull_c, mutex_s);
++    buf_put(item);
++    cond_signal(notempty_c);
++    sem_post(mutex_s);
++    break;
++  case 2:
++    fmutex_lock(&S->fm);
++    while (S->count == BUFSZ)
++      fcond_wait(&S->fnotfull, &S->fm);
++    buf_put(item);
++    fcond_signal(&S->fnotempty);
++    fmutex_unlock(&S->fm);
++    break;
++  }
++}
++
++static int
++consume(void)
++{
++  int item = -1;
++
++  switch (mode) {
++  case 0:
++    sem_wait(full_s);
++    sem_wait(mutex_s);
++    item = buf_get();
++    sem_post(mutex_s);
++    sem_post(empty_s);
++    break;
++  case 1:
++    sem_wait(mutex_s);
++    while (S->count == 0)
++      cond_wait(notempty_c, mutex_s);
++    item = buf_get();
++    cond_signal(notfull_c);
++    sem_post(mutex_s);
++    break;
++  case 2:
++    fmutex_lock(&S->fm);
++    while (S->count == 0)
++      fcond_wait(&S->fnotempty, &S->fm);
++    item = buf_get();
++    fcond_signal(&S->fnotfull);
++    fmutex_unlock(&S->fm);
++    break;
++  }
++  return item;
++}
++
++static void
++producer(int id)
++{
++  uint seed = 1000 + id;
++
++  for (int k = 0; k < per_prod; k++) {
++    spin(rnd(&seed) % 300);
++    produce(id * per_prod + k);
++  }
++}
++
++static void
++consumer(int id)
++{
++  uint seed = 5000 + id;
++  int last[MAXPROD];
++
++  for (int i = 0; i < MAXPROD; i++)
++    last[i] = -1;
++  for (int k = 0; k < per_cons; k++) {
++    spin(rnd(&seed) % 300);
++    int item = consume();
++    CHECK(item >= 0 && item < nprod * per_prod, "consumed garbage");
++    int p = item / per_prod;
++    CHECK(item > last[p], "one producer's items arrived out of order");
++    last[p] = item;
++    __atomic_fetch_add(&S->seen[item], 1, __ATOMIC_SEQ_CST);
++  }
++}
++
++static const char *names[] = { "sem", "cond", "futex" };
++
++static int
++run(int m)
++{
++  int i, total = nprod * per_prod;
++
++  mode = m;
++  memset(S, 0, sizeof(*S));
++  fmutex_init(&S->fm);
++  fcond_init(&S->fnotfull);
++  fcond_init(&S->fnotempty);
++  empty_s = sem_init(BUFSZ);
++  full_s = sem_init(0);
++  mutex_s = sem_init(1);
++  notfull_c = cond_init();
++  notempty_c = cond_init();
++  if (empty_s < 0 || full_s < 0 || mutex_s < 0 || notfull_c < 0 || notempty_c < 0) {
++    printf("pcbuf: out of kernel sync objects\n");
++    return 1;
++  }
++
++  for (i = 0; i < nprod; i++)
++    spawn(producer, i);
++  for (i = 0; i < ncons; i++)
++    spawn(consumer, i);
++  watchdog(600);
++  int bad = reap();
++
++  for (i = 0; i < total; i++)
++    if (S->seen[i] != 1) {
++      printf("pcbuf %s: item %d consumed %d times\n", names[m], i, S->seen[i]);
++      bad++;
++      break;
++    }
++  if (S->count != 0) {
++    printf("pcbuf %s: %d items left in the buffer\n", names[m], S->count);
++    bad++;
++  }
++
++  printf("pcbuf %s: %d producers, %d consumers, %d items, buffer peaked at %d/%d: %s\n",
++         names[m], nprod, ncons, total, S->maxcount, BUFSZ, bad ? "FAILED" : "ok");
++
++  sem_destroy(empty_s);
++  sem_destroy(full_s);
++  sem_destroy(mutex_s);
++  cond_destroy(notfull_c);
++  cond_destroy(notempty_c);
++  return bad != 0;
++}
++
++int
++main(int argc, char *argv[])
++{
++  int first = 0, last = 2, failed = 0;
++
++  nprod = 3;
++  ncons = 2;
++  per_prod = 120;  // 360 items; divisible by both 3 and 2 consumers
++  if (argc > 1) {
++    first = last = -1;
++    for (int i = 0; i < 3; i++)
++      if (strcmp(argv[1], names[i]) == 0)
++        first = last = i;
++    if (first < 0) {
++      fprintf(2, "usage: pcbuf [sem|cond|futex [producers [consumers [items]]]]\n");
++      exit(2);
++    }
++  }
++  if (argc > 2) nprod = atoi(argv[2]);
++  if (argc > 3) ncons = atoi(argv[3]);
++  if (argc > 4) per_prod = atoi(argv[4]);
++
++  if (nprod < 1 || nprod > MAXPROD || ncons < 1 || ncons > 16 ||
++      per_prod < 1 || nprod * per_prod > MAXITEMS ||
++      (nprod * per_prod) % ncons != 0) {
++    fprintf(2, "pcbuf: need 1..%d producers, 1..16 consumers, at most %d items in "
++            "total, and the total must divide evenly among the consumers\n",
++            MAXPROD, MAXITEMS);
++    exit(2);
++  }
++  per_cons = nprod * per_prod / ncons;
++
++  S = (struct shared *)shm_map((sizeof(struct shared) + 4095) / 4096);
++  if ((long)S == -1) {
++    printf("pcbuf: shm_map failed\n");
++    exit(1);
++  }
++
++  for (int m = first; m <= last; m++)
++    failed += run(m);
++
++  printf("pcbuf: %s\n", failed ? "FAILED" : "PASS");
++  exit(failed != 0);
++}
+diff --git a/user/philo.c b/user/philo.c
+new file mode 100644
+index 0000000..2fff3fa
+--- /dev/null
++++ b/user/philo.c
+@@ -0,0 +1,276 @@
++// Dining philosophers: five of them, five chopsticks, each philosopher
++// needs the two next to him.
++//
++//   philo                      the four correct solutions, one after another
++//   philo MODE [-v]            one solution; -v prints who eats when
++//
++//   MODE:
++//     naive       pick up left, then right. Deadlocks, on purpose: the
++//                 philosophers pause between the two grabs so that it
++//                 happens every time. The test passes when it is detected.
++//     order       resource hierarchy: always take the lower-numbered
++//                 chopstick first, so no cycle of waiting can form
++//     room        a "waiter" semaphore lets at most four to the table, so
++//                 somebody can always get both chopsticks
++//     tanenbaum   the textbook state-array solution, one semaphore per
++//                 philosopher to sleep on, one mutex for the state
++//     monitor     the same idea written as a monitor: a mutex plus one
++//                 kernel condition variable per philosopher
++//
++// A shared array records who is eating at the moment. Two neighbours eating
++// together counts as a violation and fails the run.
++
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/ptest.h"
++
++#define N      5
++#define MEALS  20
++#define LEFT(i)  (((i) + N - 1) % N)
++#define RIGHT(i) (((i) + 1) % N)
++
++enum { THINKING, HUNGRY, EATING };
++enum { NAIVE, ORDER, ROOM, TANENBAUM, MONITOR };
++
++struct table {
++  int eating[N];
++  int meals[N];
++  int state[N];
++  int violations;
++  int done;
++};
++
++static struct table *T;
++static int mode, verbose;
++static int chop[N];          // one semaphore per chopstick
++static int room_s;           // seats, N-1 of them
++static int mutex_s;          // guards state[] (tanenbaum, monitor)
++static int self_s[N];        // tanenbaum: philosopher i sleeps here
++static int self_c[N];        // monitor: philosopher i waits on this condvar
++static int out_s;            // keeps -v lines from mixing
++
++static void
++say(int i, const char *what)
++{
++  if (!verbose)
++    return;
++  sem_wait(out_s);
++  printf("philosopher %d %s\n", i, what);
++  sem_post(out_s);
++}
++
++static void
++eat(int i, uint *seed)
++{
++  __atomic_store_n(&T->eating[i], 1, __ATOMIC_SEQ_CST);
++  // Set my own flag first, then look: if two neighbours ever eat together
++  // at least one of them is sure to see the other.
++  if (__atomic_load_n(&T->eating[LEFT(i)], __ATOMIC_SEQ_CST) ||
++      __atomic_load_n(&T->eating[RIGHT(i)], __ATOMIC_SEQ_CST))
++    __atomic_fetch_add(&T->violations, 1, __ATOMIC_SEQ_CST);
++  say(i, "is eating");
++  spin(rnd(seed) % 500);
++  T->meals[i]++;
++  __atomic_store_n(&T->eating[i], 0, __ATOMIC_SEQ_CST);
++}
++
++// tanenbaum / monitor helper, called with mutex_s held
++static void
++test(int i)
++{
++  if (T->state[i] == HUNGRY && T->state[LEFT(i)] != EATING &&
++      T->state[RIGHT(i)] != EATING) {
++    T->state[i] = EATING;
++    sem_post(self_s[i]);
++  }
++}
++
++static void
++pickup(int i)
++{
++  int a, b;
++
++  switch (mode) {
++  case NAIVE:
++    sem_wait(chop[i]);
++    nap(1);                       // everybody now holds their left one
++    sem_wait(chop[RIGHT(i)]);
++    break;
++  case ORDER:
++    a = i < RIGHT(i) ? i : RIGHT(i);
++    b = i < RIGHT(i) ? RIGHT(i) : i;
++    sem_wait(chop[a]);
++    sem_wait(chop[b]);
++    break;
++  case ROOM:
++    sem_wait(room_s);
++    sem_wait(chop[i]);
++    sem_wait(chop[RIGHT(i)]);
++    break;
++  case TANENBAUM:
++    sem_wait(mutex_s);
++    T->state[i] = HUNGRY;
++    test(i);
++    sem_post(mutex_s);
++    sem_wait(self_s[i]);
++    break;
++  case MONITOR:
++    sem_wait(mutex_s);
++    T->state[i] = HUNGRY;
++    while (T->state[LEFT(i)] == EATING || T->state[RIGHT(i)] == EATING)
++      cond_wait(self_c[i], mutex_s);
++    T->state[i] = EATING;
++    sem_post(mutex_s);
++    break;
++  }
++}
++
++static void
++putdown(int i)
++{
++  switch (mode) {
++  case NAIVE:
++  case ORDER:
++    sem_post(chop[i]);
++    sem_post(chop[RIGHT(i)]);
++    break;
++  case ROOM:
++    sem_post(chop[i]);
++    sem_post(chop[RIGHT(i)]);
++    sem_post(room_s);
++    break;
++  case TANENBAUM:
++    sem_wait(mutex_s);
++    T->state[i] = THINKING;
++    test(LEFT(i));
++    test(RIGHT(i));
++    sem_post(mutex_s);
++    break;
++  case MONITOR:
++    sem_wait(mutex_s);
++    T->state[i] = THINKING;
++    cond_signal(self_c[LEFT(i)]);
++    cond_signal(self_c[RIGHT(i)]);
++    sem_post(mutex_s);
++    break;
++  }
++}
++
++static void
++philosopher(int i)
++{
++  uint seed = 31 * i + 7;
++
++  for (int m = 0; m < MEALS; m++) {
++    say(i, "is thinking");
++    spin(rnd(&seed) % 700);
++    pickup(i);
++    eat(i, &seed);
++    putdown(i);
++  }
++  __atomic_fetch_add(&T->done, 1, __ATOMIC_SEQ_CST);
++}
++
++static const char *names[] = { "naive", "order", "room", "tanenbaum", "monitor" };
++
++static int
++run(int m)
++{
++  int i, bad = 0, waited = 0;
++
++  mode = m;
++  memset(T, 0, sizeof(*T));
++  for (i = 0; i < N; i++) {
++    chop[i] = sem_init(1);
++    self_s[i] = sem_init(0);
++    self_c[i] = cond_init();
++  }
++  room_s = sem_init(N - 1);
++  mutex_s = sem_init(1);
++  out_s = sem_init(1);
++  if (out_s < 0 || self_c[N - 1] < 0) {
++    printf("philo: out of kernel sync objects\n");
++    return 1;
++  }
++
++  for (i = 0; i < N; i++)
++    spawn(philosopher, i);
++
++  // Poll instead of just waiting, so that a deadlock gets noticed.
++  while (T->done < N && waited < 300) {
++    nap(1);
++    waited++;
++  }
++
++  if (T->done < N) {
++    for (i = 0; i < nkids; i++)
++      kill(kids[i]);
++    reap();
++    if (m == NAIVE) {
++      printf("philo naive: deadlock after %d of %d meals, as expected: PASS\n",
++             T->meals[0] + T->meals[1] + T->meals[2] + T->meals[3] + T->meals[4], N * MEALS);
++      bad = 0;
++    } else {
++      printf("philo %s: stuck, %d of %d philosophers finished: FAILED\n", names[m], T->done, N);
++      bad = 1;
++    }
++  } else {
++    bad = reap();
++    int lo = MEALS, hi = 0;
++    for (i = 0; i < N; i++) {
++      if (T->meals[i] < lo) lo = T->meals[i];
++      if (T->meals[i] > hi) hi = T->meals[i];
++    }
++    if (T->violations || lo != MEALS || hi != MEALS)
++      bad++;
++    if (m == NAIVE) {
++      printf("philo naive: no deadlock this time, which should not happen: FAILED\n");
++      bad++;
++    } else {
++      printf("philo %s: everybody ate %d times, neighbours clashed %d times: %s\n",
++             names[m], hi, T->violations, bad ? "FAILED" : "ok");
++    }
++  }
++
++  for (i = 0; i < N; i++) {
++    sem_destroy(chop[i]);
++    sem_destroy(self_s[i]);
++    cond_destroy(self_c[i]);
++  }
++  sem_destroy(room_s);
++  sem_destroy(mutex_s);
++  sem_destroy(out_s);
++  return bad != 0;
++}
++
++int
++main(int argc, char *argv[])
++{
++  int first = ORDER, last = MONITOR, failed = 0;
++
++  for (int a = 1; a < argc; a++) {
++    if (strcmp(argv[a], "-v") == 0) {
++      verbose = 1;
++      continue;
++    }
++    first = -1;
++    for (int m = 0; m <= MONITOR; m++)
++      if (strcmp(argv[a], names[m]) == 0)
++        first = last = m;
++    if (first < 0) {
++      fprintf(2, "usage: philo [naive|order|room|tanenbaum|monitor] [-v]\n");
++      exit(2);
++    }
++  }
++
++  T = (struct table *)shm_map(1);
++  if ((long)T == -1) {
++    printf("philo: shm_map failed\n");
++    exit(1);
++  }
++  for (int m = first; m <= last; m++)
++    failed += run(m);
++
++  printf("philo: %s\n", failed ? "FAILED" : "PASS");
++  exit(failed != 0);
++}
+diff --git a/user/ptest.h b/user/ptest.h
+new file mode 100644
+index 0000000..d5da1d0
+--- /dev/null
++++ b/user/ptest.h
+@@ -0,0 +1,135 @@
++// Small helpers shared by the project 5 test and demo programs.
++// Everything is static inline so each program just includes this.
++//
++// The shape of every test is: parent builds shared state with shm_map(),
++// spawn()s a few workers, maybe sleeps a while to let them block, pokes
++// them, then reap()s them. reap() returns how many workers failed. A
++// watchdog process turns a deadlock into a FAIL instead of a hung qemu.
++
++#include "kernel/types.h"
++#include "user/user.h"
++
++#define MAXKID 32
++
++static int kids[MAXKID];
++static int nkids;
++static int dogpid;
++
++// Fail the whole program (nonzero exit) with a message.
++#define CHECK(cond, msg) do {                                          \
++    if (!(cond)) {                                                     \
++      printf("FAIL: %s  (%s:%d)\n", msg, __FILE__, __LINE__);          \
++      exit(1);                                                         \
++    }                                                                  \
++  } while (0)
++
++// ticks of the timer, roughly 100 ms each under qemu
++static inline void nap(int ticks) { pause(ticks); }
++
++// short busy delay, to make races more likely without a system call
++static inline void spin(int n)
++{
++  for (volatile int i = 0; i < n; i++)
++    ;
++}
++
++// tiny LCG so every process can have its own pseudo random stream
++static inline uint rnd(uint *seed)
++{
++  *seed = *seed * 1103515245 + 12345;
++  return (*seed >> 16) & 0x7fff;
++}
++
++// Start fn(arg) in a child process. The child exits 0 when fn returns.
++static inline int spawn(void (*fn)(int), int arg)
++{
++  int pid;
++
++  if (nkids >= MAXKID) {
++    printf("FAIL: too many workers\n");
++    exit(1);
++  }
++  pid = fork();
++  if (pid < 0) {
++    printf("FAIL: fork\n");
++    exit(1);
++  }
++  if (pid == 0) {
++    fn(arg);
++    exit(0);
++  }
++  kids[nkids++] = pid;
++  return pid;
++}
++
++// After this many ticks without reap() being done, kill everything,
++// including the caller, and say so. Call after the spawn()s: the watchdog
++// is a fork and has to know the pids.
++static inline void watchdog(int ticks)
++{
++  int parent = getpid();
++  int pid = fork();
++
++  if (pid == 0) {
++    nap(ticks);
++    printf("FAIL: watchdog fired after %d ticks (deadlock?)\n", ticks);
++    for (int i = 0; i < nkids; i++)
++      kill(kids[i]);
++    kill(parent);
++    exit(0);
++  }
++  dogpid = pid;
++}
++
++// Wait for every spawn()ed worker. Returns how many exited nonzero.
++static inline int reap(void)
++{
++  int left = nkids, bad = 0, st, pid;
++
++  while (left > 0) {
++    pid = wait(&st);
++    if (pid < 0)
++      break;
++    if (pid == dogpid) { // watchdog went off first
++      dogpid = 0;
++      continue;
++    }
++    if (st != 0)
++      bad++;
++    left--;
++  }
++  if (dogpid > 0) {
++    kill(dogpid);
++    wait(0);
++    dogpid = 0;
++  }
++  nkids = 0;
++  return bad;
++}
++
++// Stop one worker and collect it. Returns its exit status.
++static inline int kill_and_wait(int pid)
++{
++  int st = 0;
++
++  kill(pid);
++  for (;;) {
++    int r = wait(&st);
++    if (r == pid || r < 0)
++      break;
++  }
++  for (int i = 0; i < nkids; i++)
++    if (kids[i] == pid)
++      kids[i] = kids[--nkids];
++  return st;
++}
++
++static inline int *shm_ints(int npages)
++{
++  void *p = shm_map(npages);
++  if (p == (void *)-1) {
++    printf("FAIL: shm_map\n");
++    exit(1);
++  }
++  return (int *)p;
++}
+diff --git a/user/rwlock.c b/user/rwlock.c
+new file mode 100644
+index 0000000..378504f
+--- /dev/null
++++ b/user/rwlock.c
+@@ -0,0 +1,320 @@
++// Readers-writers with semaphores, both classic variants (Courtois,
++// Heymans, Parnas 1971):
++//
++//   reader preference   readers never wait for a writer that is merely
++//                       waiting; writers can starve
++//   writer preference   as soon as a writer is waiting no new reader may
++//                       start; readers can starve
++//
++//   rwlock                    everything below
++//   rwlock reader|writer      workload + scenario for just that variant
++//
++// Workload: several readers and writers hammer one shared record. Writers
++// update it in two steps with a gap in between, so any reader that gets in
++// while a writer is active sees the halves disagree. Entry checks also
++// count who is inside.
++//
++// Scenario: the difference between the two variants, made visible.
++//   t=0   reader A takes the lock and holds it for a while
++//   t=2   writer W arrives and has to wait for A
++//   t=4   reader B arrives
++// With reader preference B slips in next to A, ahead of W. With writer
++// preference B has to wait behind W.
++
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/ptest.h"
++
++struct rw {
++  int readcount, writecount;   // guarded by rmutex / wmutex
++  int active_r, active_w;      // who is really inside, for the checks
++  int maxr;                    // most readers inside together
++  int a, b;                    // the record; a == b whenever no writer is mid-update
++  int nlog;
++  int log[8];                  // scenario events, in order
++};
++
++enum { A_IN = 1, A_OUT, W_IN, W_OUT, B_IN, B_OUT };
++
++static struct rw *R;
++static int pref;                 // 0 reader preference, 1 writer preference
++static int rmutex, wmutex, wrt, readtry, resource;   // semaphore handles
++
++// ---- the two protocols ------------------------------------------------
++
++static void
++read_lock(void)
++{
++  if (pref == 0) {
++    sem_wait(rmutex);
++    if (++R->readcount == 1)
++      sem_wait(wrt);
++    sem_post(rmutex);
++  } else {
++    sem_wait(readtry);
++    sem_wait(rmutex);
++    if (++R->readcount == 1)
++      sem_wait(resource);
++    sem_post(rmutex);
++    sem_post(readtry);
++  }
++}
++
++static void
++read_unlock(void)
++{
++  sem_wait(rmutex);
++  if (--R->readcount == 0)
++    sem_post(pref == 0 ? wrt : resource);
++  sem_post(rmutex);
++}
++
++static void
++write_lock(void)
++{
++  if (pref == 0) {
++    sem_wait(wrt);
++  } else {
++    sem_wait(wmutex);
++    if (++R->writecount == 1)
++      sem_wait(readtry);          // first waiting writer shuts the door on readers
++    sem_post(wmutex);
++    sem_wait(resource);
++  }
++}
++
++static void
++write_unlock(void)
++{
++  if (pref == 0) {
++    sem_post(wrt);
++  } else {
++    sem_post(resource);
++    sem_wait(wmutex);
++    if (--R->writecount == 0)
++      sem_post(readtry);          // last writer reopens it
++    sem_post(wmutex);
++  }
++}
++
++// ---- workload ---------------------------------------------------------
++
++#define READERS 4
++#define WRITERS 2
++#define READS   40
++#define WRITES  20
++
++static void
++reader(int id)
++{
++  uint seed = 77 + id;
++
++  for (int i = 0; i < READS; i++) {
++    spin(rnd(&seed) % 400);
++    read_lock();
++    int in = __atomic_add_fetch(&R->active_r, 1, __ATOMIC_SEQ_CST);
++    CHECK(__atomic_load_n(&R->active_w, __ATOMIC_SEQ_CST) == 0, "reader inside with a writer");
++    int m = R->maxr;
++    while (in > m && !__atomic_compare_exchange_n(&R->maxr, &m, in, 0,
++           __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++      ;
++    int x = R->a;
++    spin(rnd(&seed) % 300);
++    if (i % 10 == 0)
++      nap(1);                   // a long read, so that readers pile up
++    CHECK(x == R->b, "reader saw a half-written record");
++    __atomic_sub_fetch(&R->active_r, 1, __ATOMIC_SEQ_CST);
++    read_unlock();
++  }
++}
++
++static void
++writer(int id)
++{
++  uint seed = 99 + id;
++
++  for (int i = 0; i < WRITES; i++) {
++    spin(rnd(&seed) % 800);
++    write_lock();
++    int w = __atomic_fetch_add(&R->active_w, 1, __ATOMIC_SEQ_CST);
++    CHECK(w == 0, "two writers inside");
++    CHECK(__atomic_load_n(&R->active_r, __ATOMIC_SEQ_CST) == 0, "writer inside with readers");
++    int v = R->a;
++    R->a = v + 1;
++    spin(rnd(&seed) % 300);     // readers would see a != b here
++    R->b = v + 1;
++    __atomic_sub_fetch(&R->active_w, 1, __ATOMIC_SEQ_CST);
++    write_unlock();
++  }
++}
++
++static const char *pname[] = { "reader preference", "writer preference" };
++
++static int
++workload(void)
++{
++  int i;
++
++  for (i = 0; i < READERS; i++)
++    spawn(reader, i);
++  for (i = 0; i < WRITERS; i++)
++    spawn(writer, i);
++  watchdog(600);
++  int bad = reap();
++  if (R->a != WRITERS * WRITES || R->b != R->a) {
++    printf("rwlock: lost updates, record is %d/%d, expected %d\n", R->a, R->b, WRITERS * WRITES);
++    bad++;
++  }
++  if (R->maxr < 2) {
++    printf("rwlock: readers never overlapped, that is not a readers-writers lock\n");
++    bad++;
++  }
++  printf("rwlock %s: %d readers + %d writers, record = %d, up to %d readers at once: %s\n",
++         pname[pref], READERS, WRITERS, R->a, R->maxr, bad ? "FAILED" : "ok");
++  return bad != 0;
++}
++
++// ---- scenario ---------------------------------------------------------
++
++static void
++logev(int ev)
++{
++  int i = __atomic_fetch_add(&R->nlog, 1, __ATOMIC_SEQ_CST);
++  R->log[i] = ev;
++}
++
++static int
++position(int ev)
++{
++  for (int i = 0; i < R->nlog; i++)
++    if (R->log[i] == ev)
++      return i;
++  return -1;
++}
++
++static void
++scen_reader_a(int arg)
++{
++  read_lock();
++  logev(A_IN);
++  nap(10);
++  logev(A_OUT);
++  read_unlock();
++}
++
++static void
++scen_writer(int arg)
++{
++  write_lock();
++  logev(W_IN);
++  nap(2);
++  logev(W_OUT);
++  write_unlock();
++}
++
++static void
++scen_reader_b(int arg)
++{
++  read_lock();
++  logev(B_IN);
++  nap(2);
++  logev(B_OUT);
++  read_unlock();
++}
++
++static int
++scenario(void)
++{
++  static const char *evname[] = { "?", "A in", "A out", "W in", "W out", "B in", "B out" };
++  int bad = 0;
++
++  R->nlog = 0;
++  spawn(scen_reader_a, 0);
++  nap(2);
++  spawn(scen_writer, 0);
++  nap(2);
++  spawn(scen_reader_b, 0);
++  watchdog(300);
++  bad = reap();
++
++  printf("rwlock %s, scenario: ", pname[pref]);
++  for (int i = 0; i < R->nlog; i++)
++    printf("%s%s", i ? ", " : "", evname[R->log[i]]);
++  printf("\n");
++
++  int w = position(W_IN), b = position(B_IN);
++  if (R->nlog != 6 || w < 0 || b < 0) {
++    printf("rwlock: scenario did not run to completion\n");
++    return 1;
++  }
++  if (pref == 0 && !(b < w)) {
++    printf("rwlock: reader preference should let B in before W\n");
++    bad++;
++  }
++  if (pref == 1 && !(w < b)) {
++    printf("rwlock: writer preference should make B wait for W\n");
++    bad++;
++  }
++  // and in no case may W overlap with anybody
++  if (position(W_IN) < position(A_OUT) || (position(B_IN) > position(W_IN) && position(B_IN) < position(W_OUT))) {
++    printf("rwlock: writer overlapped with a reader\n");
++    bad++;
++  }
++  return bad != 0;
++}
++
++// ---- main -------------------------------------------------------------
++
++static int
++run(int p)
++{
++  int bad;
++
++  pref = p;
++  memset(R, 0, sizeof(*R));
++  rmutex = sem_init(1);
++  wmutex = sem_init(1);
++  wrt = sem_init(1);
++  readtry = sem_init(1);
++  resource = sem_init(1);
++  if (rmutex < 0 || wmutex < 0 || wrt < 0 || readtry < 0 || resource < 0) {
++    printf("rwlock: out of semaphores\n");
++    return 1;
++  }
++  bad = workload();
++  memset(R, 0, sizeof(*R));
++  bad += scenario();
++
++  sem_destroy(rmutex);
++  sem_destroy(wmutex);
++  sem_destroy(wrt);
++  sem_destroy(readtry);
++  sem_destroy(resource);
++  return bad != 0;
++}
++
++int
++main(int argc, char *argv[])
++{
++  int first = 0, last = 1, failed = 0;
++
++  if (argc > 1) {
++    if (strcmp(argv[1], "reader") == 0)
++      first = last = 0;
++    else if (strcmp(argv[1], "writer") == 0)
++      first = last = 1;
++    else {
++      fprintf(2, "usage: rwlock [reader|writer]\n");
++      exit(2);
++    }
++  }
++  R = (struct rw *)shm_map(1);
++  if ((long)R == -1) {
++    printf("rwlock: shm_map failed\n");
++    exit(1);
++  }
++  for (int p = first; p <= last; p++)
++    failed += run(p);
++  printf("rwlock: %s\n", failed ? "FAILED" : "PASS");
++  exit(failed != 0);
++}
+diff --git a/user/semtest.c b/user/semtest.c
+new file mode 100644
+index 0000000..e1f259d
+--- /dev/null
++++ b/user/semtest.c
+@@ -0,0 +1,262 @@
++// Unit tests for the semaphore system calls.
++
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++#include "user/ptest.h"
++
++static int *shared; // shared[0..]: scratch cells for the workers
++
++// --- individual tests -------------------------------------------------
++
++static void
++test_basic(void)
++{
++  int s = sem_init(2);
++  CHECK(s >= 0, "sem_init");
++  CHECK(sem_getvalue(s) == 2, "initial value");
++  CHECK(sem_wait(s) == 0 && sem_wait(s) == 0, "two waits succeed");
++  CHECK(sem_getvalue(s) == 0, "value is 0 after two waits");
++  CHECK(sem_trywait(s) == 1, "trywait on empty reports would-block");
++  CHECK(sem_post(s) == 0, "post");
++  CHECK(sem_getvalue(s) == 1, "value is 1 after post");
++  CHECK(sem_trywait(s) == 0, "trywait takes the token");
++  CHECK(sem_destroy(s) == 0, "destroy");
++  CHECK(sem_destroy(s) == -1, "second destroy fails");
++  CHECK(sem_wait(s) == -1, "wait on destroyed handle fails");
++  CHECK(sem_post(s) == -1, "post on destroyed handle fails");
++}
++
++static void
++test_bad_handles(void)
++{
++  CHECK(sem_init(-1) == -1, "negative initial value rejected");
++  CHECK(sem_wait(-1) == -1, "wait(-1)");
++  CHECK(sem_wait(NSEM) == -1, "wait(NSEM)");
++  CHECK(sem_post(100000) == -1, "post(100000)");
++  CHECK(sem_trywait(-5) == -1, "trywait(-5)");
++  CHECK(sem_destroy(NSEM + 3) == -1, "destroy out of range");
++  // a handle that was destroyed is dead for good
++  int s = sem_init(0);
++  CHECK(s >= 0, "sem_init");
++  CHECK(sem_destroy(s) == 0, "destroy");
++  CHECK(sem_getvalue(s) == -1, "stale handle");
++}
++
++static void
++test_overflow(void)
++{
++  int s = sem_init(0x7fffffff);
++  CHECK(s >= 0, "init INT_MAX");
++  CHECK(sem_post(s) == -1, "post at INT_MAX fails");
++  CHECK(sem_wait(s) == 0, "wait");
++  CHECK(sem_post(s) == 0, "post fits again");
++  sem_destroy(s);
++}
++
++static void
++test_table_full(void)
++{
++  int h[NSEM + 1], n = 0, i;
++
++  while (n <= NSEM && (h[n] = sem_init(1)) >= 0)
++    n++;
++  CHECK(n == NSEM, "exactly NSEM semaphores can exist");
++  CHECK(sem_init(1) == -1, "table full");
++  for (i = 0; i < n; i++)
++    CHECK(sem_destroy(h[i]) == 0, "destroy all");
++  CHECK((h[0] = sem_init(1)) >= 0, "slot free again");
++  sem_destroy(h[0]);
++}
++
++static void
++leaky_child(int arg)
++{
++  // grabs every slot and exits without destroying any of them
++  while (sem_init(0) >= 0)
++    ;
++}
++
++static void
++test_exit_releases(void)
++{
++  spawn(leaky_child, 0);
++  CHECK(reap() == 0, "child ran");
++  // if the child's handles had leaked, this would come up short
++  int h[NSEM + 1], n = 0, i;
++  while (n <= NSEM && (h[n] = sem_init(0)) >= 0)
++    n++;
++  CHECK(n == NSEM, "dead process released its semaphores");
++  for (i = 0; i < n; i++)
++    sem_destroy(h[i]);
++}
++
++static void
++blocker(int s)
++{
++  if (sem_wait(s) < 0)
++    exit(1);
++  shared[0] = 1;
++}
++
++static void
++test_blocking(void)
++{
++  int s = sem_init(0);
++  shared[0] = 0;
++  spawn(blocker, s);
++  nap(3);
++  CHECK(shared[0] == 0, "waiter is still blocked");
++  CHECK(sem_getvalue(s) == 0, "no token while a waiter sleeps");
++  CHECK(sem_post(s) == 0, "post");
++  CHECK(reap() == 0, "waiter finished");
++  CHECK(shared[0] == 1, "waiter ran after the post");
++  CHECK(sem_getvalue(s) == 0, "token went straight to the waiter");
++  sem_destroy(s);
++}
++
++static void
++fifo_waiter(int arg)
++{
++  int s = arg >> 8, id = arg & 0xff;
++  if (sem_wait(s) < 0)
++    exit(1);
++  int slot = __atomic_fetch_add(&shared[1], 1, __ATOMIC_SEQ_CST);
++  shared[2 + slot] = id;
++}
++
++static void
++test_fifo(void)
++{
++  int s = sem_init(0), i;
++  shared[1] = 0;
++  for (i = 0; i < 6; i++) {
++    spawn(fifo_waiter, (s << 8) | i);
++    nap(2); // let it block before the next one arrives
++  }
++  for (i = 0; i < 6; i++) {
++    CHECK(sem_post(s) == 0, "post");
++    nap(2); // let the woken one log itself
++  }
++  CHECK(reap() == 0, "waiters finished");
++  for (i = 0; i < 6; i++)
++    CHECK(shared[2 + i] == i, "wakeups come in arrival order");
++  sem_destroy(s);
++}
++
++static void
++test_kill_waiter(void)
++{
++  int s = sem_init(0);
++  int pid = spawn(blocker, s);
++  nap(3);
++  int st = kill_and_wait(pid);
++  CHECK(st == -1, "killed waiter exits with -1");
++  // The dead process must not still be on the queue, or this token
++  // would be handed to a ghost and lost.
++  CHECK(sem_post(s) == 0, "post");
++  CHECK(sem_getvalue(s) == 1, "token was not eaten by the dead waiter");
++  CHECK(sem_trywait(s) == 0, "token is there");
++  sem_destroy(s);
++}
++
++static void
++user_of_inherited(int s)
++{
++  // parent has already destroyed its own handle
++  if (sem_wait(s) != 0)
++    exit(1);
++  if (sem_getvalue(s) != 0)
++    exit(1);
++}
++
++static void
++test_inherit(void)
++{
++  int s = sem_init(1);
++  spawn(user_of_inherited, s);
++  CHECK(sem_destroy(s) == 0, "parent drops its handle");
++  CHECK(sem_post(s) == -1, "parent can no longer use it");
++  CHECK(reap() == 0, "child still has a working semaphore");
++}
++
++static void
++counter_worker(int arg)
++{
++  int s = arg;
++  for (int i = 0; i < 400; i++) {
++    sem_wait(s);
++    int t = shared[0];
++    spin(20);           // wide window for a race, if there were one
++    shared[0] = t + 1;
++    sem_post(s);
++  }
++}
++
++static void
++test_mutual_exclusion(void)
++{
++  int s = sem_init(1), i;
++  shared[0] = 0;
++  for (i = 0; i < 4; i++)
++    spawn(counter_worker, s);
++  watchdog(300);
++  CHECK(reap() == 0, "workers finished");
++  CHECK(shared[0] == 1600, "no lost updates under a binary semaphore");
++  sem_destroy(s);
++}
++
++static void
++test_counting(void)
++{
++  // a semaphore with N tokens lets exactly N processes through at once
++  int s = sem_init(3), i;
++  shared[0] = 0; // inside right now
++  shared[1] = 0; // most that were ever inside together
++  for (i = 0; i < 6; i++) {
++    int pid = fork();
++    if (pid == 0) {
++      for (int k = 0; k < 4; k++) {
++        sem_wait(s);
++        int in = __atomic_add_fetch(&shared[0], 1, __ATOMIC_SEQ_CST);
++        int m = shared[1];
++        while (in > m && !__atomic_compare_exchange_n(&shared[1], &m, in, 0,
++               __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++          ;
++        nap(1);   // hold the token across a timer tick so the others pile up
++        __atomic_sub_fetch(&shared[0], 1, __ATOMIC_SEQ_CST);
++        sem_post(s);
++      }
++      exit(0);
++    }
++    kids[nkids++] = pid;
++  }
++  watchdog(300);
++  CHECK(reap() == 0, "workers finished");
++  CHECK(shared[1] == 3, "exactly 3 were inside together, never more");
++  sem_destroy(s);
++}
++
++// --- driver -----------------------------------------------------------
++
++#define RUN(t) do { printf("  %s ... ", #t); t(); printf("ok\n"); } while (0)
++
++int
++main(void)
++{
++  shared = shm_ints(1);
++  printf("semtest\n");
++  RUN(test_basic);
++  RUN(test_bad_handles);
++  RUN(test_overflow);
++  RUN(test_table_full);
++  RUN(test_exit_releases);
++  RUN(test_blocking);
++  RUN(test_fifo);
++  RUN(test_kill_waiter);
++  RUN(test_inherit);
++  RUN(test_mutual_exclusion);
++  RUN(test_counting);
++  printf("semtest: PASS\n");
++  exit(0);
++}
+diff --git a/user/shmtest.c b/user/shmtest.c
+new file mode 100644
+index 0000000..6bc41e0
+--- /dev/null
++++ b/user/shmtest.c
+@@ -0,0 +1,186 @@
++// Tests for shm_map(): the shared pages that make fork-based
++// synchronization possible, and the page reference counting under them.
++
++#include "kernel/types.h"
++#include "kernel/param.h"
++#include "user/user.h"
++#include "user/ptest.h"
++
++static void
++test_limits(void)
++{
++  CHECK(shm_map(0) == (void *)-1, "0 pages");
++  CHECK(shm_map(-4) == (void *)-1, "negative pages");
++  CHECK(shm_map(SHM_MAXPAGES + 1) == (void *)-1, "more than the cap");
++}
++
++static void
++test_zeroed_and_stacking(void)
++{
++  char *a = shm_map(2);
++  char *b = shm_map(1);
++  CHECK(a != (char *)-1 && b != (char *)-1, "shm_map");
++  CHECK(b + 4096 == a, "regions stack downwards without gaps");
++  for (int i = 0; i < 2 * 4096; i += 97)
++    CHECK(a[i] == 0, "fresh pages are zeroed");
++  a[0] = 1;
++  a[2 * 4096 - 1] = 2;   // both ends writable
++  b[0] = 3;
++}
++
++static void
++test_shared_with_child(void)
++{
++  int *c = shm_ints(1);
++  c[0] = 10;
++  int pid = fork();
++  if (pid == 0) {
++    c[0] += 5;           // visible to the parent
++    c[1] = 99;
++    exit(0);
++  }
++  wait(0);
++  CHECK(c[0] == 15 && c[1] == 99, "parent sees the child's writes");
++}
++
++static void
++test_heap_stays_private(void)
++{
++  int n = 100 * 1024;
++  char *heap = malloc(n);
++  int *c = shm_ints(1);
++  CHECK(heap != 0, "malloc");
++  memset(heap, 7, n);
++  c[0] = 0;
++  int pid = fork();
++  if (pid == 0) {
++    for (int i = 0; i < n; i += 511)
++      if (heap[i] != 7)
++        exit(1);          // child got a copy of the heap
++    memset(heap, 8, n);   // ... which it may scribble on
++    c[0] = 1;
++    exit(0);
++  }
++  int st;
++  wait(&st);
++  CHECK(st == 0, "child saw the parent's heap contents");
++  CHECK(c[0] == 1, "shared write arrived");
++  for (int i = 0; i < n; i += 511)
++    CHECK(heap[i] == 7, "child's heap writes did not leak into the parent");
++  free(heap);
++}
++
++// the earlier tests already mapped 6 pages in this process, and the
++// per-process cap counts them (children inherit them)
++#define BIG (SHM_MAXPAGES - 8)
++
++static void
++test_no_leak_on_exit(void)
++{
++  // 600 * 56 pages is more than all of RAM. If exiting processes did not
++  // give their shared pages back, kalloc would run dry long before the end.
++  for (int i = 0; i < 600; i++) {
++    int pid = fork();
++    CHECK(pid >= 0, "fork");
++    if (pid == 0) {
++      char *m = shm_map(BIG);
++      if (m == (char *)-1)
++        exit(1);
++      m[0] = 1;
++      m[BIG * 4096 - 1] = 1;
++      exit(0);
++    }
++    int st;
++    wait(&st);
++    CHECK(st == 0, "child could always map its pages");
++  }
++}
++
++static void
++test_no_leak_on_exec(void)
++{
++  // exec throws the shared window away; the pages must go with it
++  char *args[] = { "echo", "x", 0 };
++  for (int i = 0; i < 600; i++) {
++    int pid = fork();
++    CHECK(pid >= 0, "fork");
++    if (pid == 0) {
++      if (shm_map(BIG) == (void *)-1)
++        exit(1);
++      close(1);               // keep echo quiet
++      exec("echo", args);
++      exit(2);
++    }
++    int st;
++    wait(&st);
++    CHECK(st == 0, "map then exec");
++  }
++}
++
++static void
++test_many_sharers(void)
++{
++  // one page, eight processes holding it; it must survive until the last
++  // of them has gone, whatever the order
++  int *c = shm_ints(1);
++  c[0] = 0;
++  for (int i = 0; i < 8; i++) {
++    int pid = fork();
++    CHECK(pid >= 0, "fork");
++    if (pid == 0) {
++      nap(1 + i % 3);
++      __atomic_fetch_add(&c[0], 1, __ATOMIC_SEQ_CST);
++      exit(0);
++    }
++  }
++  for (int i = 0; i < 8; i++)
++    wait(0);
++  CHECK(c[0] == 8, "all eight updates landed");
++}
++
++static void
++test_fork_failure_paths(void)
++{
++  // fill the process table, fork keeps failing cleanly, and nothing leaks
++  int pids[NPROC], n = 0;
++  char *m = shm_map(4);
++  CHECK(m != (char *)-1, "shm_map");
++  for (;;) {
++    int pid = fork();
++    if (pid < 0)
++      break;
++    if (pid == 0) {
++      for (;;)
++        nap(100);
++    }
++    pids[n++] = pid;
++  }
++  CHECK(n > 10, "forked a good number");
++  for (int i = 0; i < n; i++)
++    kill(pids[i]);
++  for (int i = 0; i < n; i++)
++    wait(0);
++  int pid = fork();
++  if (pid == 0)
++    exit(0);
++  CHECK(pid > 0, "fork works again after the table drained");
++  wait(0);
++}
++
++#define RUN(t) do { printf("  %s ... ", #t); t(); printf("ok\n"); } while (0)
++
++int
++main(void)
++{
++  printf("shmtest\n");
++  RUN(test_limits);
++  RUN(test_zeroed_and_stacking);
++  RUN(test_shared_with_child);
++  RUN(test_heap_stays_private);
++  RUN(test_many_sharers);
++  RUN(test_no_leak_on_exit);
++  RUN(test_no_leak_on_exec);
++  RUN(test_fork_failure_paths);
++  printf("shmtest: PASS\n");
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..4e2b1e9 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -26,6 +26,40 @@ int pause(int);
+ int uptime(void);
+ int sync(void);
+ 
++// project 5: semaphores, condition variables, futexes, shared memory
++int sem_init(int value);
++int sem_wait(int sd);
++int sem_trywait(int sd);
++int sem_post(int sd);
++int sem_getvalue(int sd);
++int sem_destroy(int sd);
++int cond_init(void);
++int cond_wait(int cd, int sd);
++int cond_signal(int cd);
++int cond_broadcast(int cd);
++int cond_destroy(int cd);
++int futex_wait(int *addr, int val);
++int futex_wake(int *addr, int n);
++void *shm_map(int npages);
++
++// Lock contention profiler
++#ifndef _LOCK_STAT_DEFINED
++#define _LOCK_STAT_DEFINED
++#define LOCK_NAME_MAX 16
++#define LOCKSTAT_AGGREGATE 0
++#define LOCKSTAT_RESET     1
++#define LOCKSTAT_RAW       2
++
++struct lock_stat {
++  char name[LOCK_NAME_MAX];
++  uint64 n_acq;
++  uint64 n_contended;
++  uint64 n_spins;
++};
++#endif
++
++int lockstat(struct lock_stat *stats, int max, int mode);
++
+ // ulib.c
+ int stat(const char *, struct stat *);
+ char *strcpy(char *, const char *);
+diff --git a/user/usync.c b/user/usync.c
+new file mode 100644
+index 0000000..77bd9b3
+--- /dev/null
++++ b/user/usync.c
+@@ -0,0 +1,103 @@
++#include "kernel/types.h"
++#include "user/user.h"
++#include "user/usync.h"
++
++// The mutex is the three-state design from Drepper's "Futexes Are Tricky".
++//   0  free
++//   1  held, nobody is (or needs to be) asleep
++//   2  held, and a sleeper may be waiting for the unlock
++// Unlock only makes a system call when the state was 2.
++
++void
++fmutex_init(fmutex_t *m)
++{
++  m->state = 0;
++}
++
++void
++fmutex_lock(fmutex_t *m)
++{
++  int c = 0;
++
++  // fast path 0 -> 1. On failure c is updated to what was there.
++  if (__atomic_compare_exchange_n(&m->state, &c, 1, 0,
++                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
++    return;
++
++  // Contended. Mark the lock "has sleepers" (2) and sleep until we are the
++  // one who sees it free. We leave it at 2 when we win, which costs one
++  // spurious wake on our own unlock but can never lose a sleeper.
++  if (c != 2)
++    c = __atomic_exchange_n(&m->state, 2, __ATOMIC_ACQUIRE);
++  while (c != 0) {
++    if (futex_wait(&m->state, 2) < 0)
++      return;       // killed; the kernel is about to end this process
++    c = __atomic_exchange_n(&m->state, 2, __ATOMIC_ACQUIRE);
++  }
++}
++
++int
++fmutex_trylock(fmutex_t *m)
++{
++  int c = 0;
++
++  if (__atomic_compare_exchange_n(&m->state, &c, 1, 0,
++                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
++    return 0;
++  return -1;
++}
++
++void
++fmutex_unlock(fmutex_t *m)
++{
++  // 1 -> 0 and nobody to wake, or it was 2 and we have to.
++  if (__atomic_fetch_sub(&m->state, 1, __ATOMIC_RELEASE) != 1) {
++    __atomic_store_n(&m->state, 0, __ATOMIC_RELEASE);
++    futex_wake(&m->state, 1);
++  }
++}
++
++// Condition variable, sequence-number style. A waiter remembers seq, lets
++// go of the mutex and sleeps *only if seq is still the same*. A signal that
++// slips in after the unlock changes seq, so futex_wait() returns at once
++// instead of sleeping through it. That is the no-lost-wakeup argument.
++//
++// The waiters count lets signal skip the system call when the queue is
++// empty. That is safe as long as signalers change the predicate while they
++// hold the mutex, which is the rule for condition variables anyway.
++
++void
++fcond_init(fcond_t *c)
++{
++  c->seq = 0;
++  c->waiters = 0;
++}
++
++void
++fcond_wait(fcond_t *c, fmutex_t *m)
++{
++  int seq;
++
++  __atomic_fetch_add(&c->waiters, 1, __ATOMIC_SEQ_CST);
++  seq = __atomic_load_n(&c->seq, __ATOMIC_SEQ_CST);
++  fmutex_unlock(m);
++  futex_wait(&c->seq, seq);
++  __atomic_fetch_sub(&c->waiters, 1, __ATOMIC_SEQ_CST);
++  fmutex_lock(m);
++}
++
++void
++fcond_signal(fcond_t *c)
++{
++  __atomic_fetch_add(&c->seq, 1, __ATOMIC_SEQ_CST);
++  if (__atomic_load_n(&c->waiters, __ATOMIC_SEQ_CST) > 0)
++    futex_wake(&c->seq, 1);
++}
++
++void
++fcond_broadcast(fcond_t *c)
++{
++  __atomic_fetch_add(&c->seq, 1, __ATOMIC_SEQ_CST);
++  if (__atomic_load_n(&c->waiters, __ATOMIC_SEQ_CST) > 0)
++    futex_wake(&c->seq, -1);
++}
+diff --git a/user/usync.h b/user/usync.h
+new file mode 100644
+index 0000000..7fb8506
+--- /dev/null
++++ b/user/usync.h
+@@ -0,0 +1,27 @@
++// User-level synchronization built only on futex_wait()/futex_wake().
++//
++// Nothing here enters the kernel unless there is real contention, which is
++// the point of futexes: an uncontended lock or a signal with nobody waiting
++// is a couple of atomic instructions.
++//
++// All of it works on memory that is shared between processes, i.e. memory
++// from shm_map(), and every object must be initialized once before fork().
++
++typedef struct {
++  int state;   // 0 unlocked, 1 locked, 2 locked and somebody may be asleep
++} fmutex_t;
++
++typedef struct {
++  int seq;     // bumped by every signal; sleepers wait for it to change
++  int waiters; // processes between "I'm going to wait" and "I woke up"
++} fcond_t;
++
++void fmutex_init(fmutex_t *m);
++void fmutex_lock(fmutex_t *m);
++int  fmutex_trylock(fmutex_t *m);   // 0 if acquired, -1 if it was taken
++void fmutex_unlock(fmutex_t *m);
++
++void fcond_init(fcond_t *c);
++void fcond_wait(fcond_t *c, fmutex_t *m);   // m must be locked by the caller
++void fcond_signal(fcond_t *c);
++void fcond_broadcast(fcond_t *c);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..ef3b749 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,18 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("sem_init");
++entry("sem_wait");
++entry("sem_trywait");
++entry("sem_post");
++entry("sem_getvalue");
++entry("sem_destroy");
++entry("cond_init");
++entry("cond_wait");
++entry("cond_signal");
++entry("cond_broadcast");
++entry("cond_destroy");
++entry("futex_wait");
++entry("futex_wake");
++entry("shm_map");
++entry("lockstat");
